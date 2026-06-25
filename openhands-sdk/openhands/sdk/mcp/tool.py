@@ -17,10 +17,12 @@ from openhands.sdk.llm import TextContent
 from openhands.sdk.logger import get_logger
 from openhands.sdk.mcp.client import MCPClient
 from openhands.sdk.mcp.definition import MCPToolAction, MCPToolObservation
+from openhands.sdk.mcp.resources import MCPToolResourcePolicy
 from openhands.sdk.observability.laminar import observe
 from openhands.sdk.skills.utils import expand_variable_references
 from openhands.sdk.tool import (
     Action,
+    DeclaredResources,
     Observation,
     ToolAnnotations,
     ToolDefinition,
@@ -199,6 +201,18 @@ class MCPToolDefinition(ToolDefinition[MCPToolAction, MCPToolObservation]):
     """MCP Tool that wraps an MCP client and provides tool functionality."""
 
     mcp_tool: mcp.types.Tool = Field(description="The MCP tool definition.")
+    resource_policy: MCPToolResourcePolicy | None = Field(
+        default=None,
+        description="OpenHands resource declaration policy for this MCP tool.",
+    )
+    mcp_server_name: str | None = Field(
+        default=None,
+        description="MCP server name inferred from the tool source.",
+    )
+    mcp_original_tool_name: str | None = Field(
+        default=None,
+        description="Original MCP tool name before client-side prefixing.",
+    )
 
     @property
     def name(self) -> str:  # type: ignore[override]
@@ -241,6 +255,17 @@ class MCPToolDefinition(ToolDefinition[MCPToolAction, MCPToolObservation]):
 
         return super().__call__(action, conversation)
 
+    def declared_resources(self, action: Action) -> DeclaredResources:
+        if self.resource_policy is None or not isinstance(action, MCPToolAction):
+            return super().declared_resources(action)
+
+        return self.resource_policy.to_declared_resources(
+            arguments=action.data,
+            tool_name=self.name,
+            original_tool_name=self.mcp_original_tool_name or self.name,
+            server_name=self.mcp_server_name,
+        )
+
     def action_from_arguments(self, arguments: dict[str, Any]) -> MCPToolAction:
         """Create an MCPToolAction from parsed arguments with early validation.
 
@@ -278,6 +303,9 @@ class MCPToolDefinition(ToolDefinition[MCPToolAction, MCPToolObservation]):
         cls,
         mcp_tool: mcp.types.Tool,
         mcp_client: MCPClient,
+        resource_policy: MCPToolResourcePolicy | None = None,
+        server_name: str | None = None,
+        original_tool_name: str | None = None,
     ) -> Sequence["MCPToolDefinition"]:
         try:
             annotations = (
@@ -297,6 +325,9 @@ class MCPToolDefinition(ToolDefinition[MCPToolAction, MCPToolObservation]):
                 executor=MCPToolExecutor(tool_name=mcp_tool.name, client=mcp_client),
                 # pass-through fields (enabled by **extra in Tool.create)
                 mcp_tool=mcp_tool,
+                resource_policy=resource_policy,
+                mcp_server_name=server_name,
+                mcp_original_tool_name=original_tool_name or mcp_tool.name,
             )
             return [tool_instance]
         except ValidationError as e:

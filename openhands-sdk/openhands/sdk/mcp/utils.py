@@ -9,6 +9,12 @@ from fastmcp.mcp_config import MCPConfig
 from openhands.sdk.logger import get_logger
 from openhands.sdk.mcp.client import MCPClient
 from openhands.sdk.mcp.exceptions import MCPTimeoutError
+from openhands.sdk.mcp.resources import (
+    MCPToolResourcePolicy,
+    infer_mcp_server_and_original_tool_name,
+    resource_policies_from_config,
+    select_mcp_tool_resource_policy,
+)
 from openhands.sdk.mcp.tool import MCPToolDefinition
 
 
@@ -31,12 +37,33 @@ async def log_handler(message: LogMessage):
     logger.log(level, msg, extra=extra)
 
 
-async def _connect_and_list_tools(client: MCPClient) -> None:
+async def _connect_and_list_tools(
+    client: MCPClient,
+    server_names: tuple[str, ...],
+    resource_policies: tuple[MCPToolResourcePolicy, ...] = (),
+) -> None:
     """Connect to MCP server and populate client._tools."""
     await client.connect()
     mcp_type_tools: list[mcp.types.Tool] = await client.list_tools()
     for mcp_tool in mcp_type_tools:
-        tool_sequence = MCPToolDefinition.create(mcp_tool=mcp_tool, mcp_client=client)
+        server_name, original_tool_name = infer_mcp_server_and_original_tool_name(
+            tool_name=mcp_tool.name,
+            server_names=server_names,
+        )
+        resource_policy = select_mcp_tool_resource_policy(
+            tool_name=mcp_tool.name,
+            original_tool_name=original_tool_name,
+            server_name=server_name,
+            meta=mcp_tool.meta,
+            config_policies=resource_policies,
+        )
+        tool_sequence = MCPToolDefinition.create(
+            mcp_tool=mcp_tool,
+            mcp_client=client,
+            resource_policy=resource_policy,
+            server_name=server_name,
+            original_tool_name=original_tool_name,
+        )
         client._tools.extend(tool_sequence)
 
 
@@ -55,11 +82,17 @@ def create_mcp_tools(
     """
     if isinstance(config, dict):
         config = MCPConfig.model_validate(config)
+    resource_policies = resource_policies_from_config(config)
+    server_names = tuple(config.mcpServers.keys())
     client = MCPClient(config, log_handler=log_handler)
 
     try:
         client.call_async_from_sync(
-            _connect_and_list_tools, timeout=timeout, client=client
+            _connect_and_list_tools,
+            timeout=timeout,
+            client=client,
+            server_names=server_names,
+            resource_policies=resource_policies,
         )
     except TimeoutError as e:
         client.sync_close()
