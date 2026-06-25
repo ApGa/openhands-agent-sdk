@@ -201,8 +201,40 @@ def test_programmatic_tool_calling_exposes_tools_as_python_functions(
 
     assert obs.is_error is False
     assert "haha" in obs.text
-    assert "Tool calls:" in obs.text
+    assert "Tool calls:" not in obs.text
     assert echo_executor.calls == [EchoAction(text="ha", repeat=2)]
+
+
+def test_programmatic_tool_calling_keeps_unprinted_tool_results_quiet(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+    echo_executor: EchoExecutor,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        'result = echo(text="quiet")',
+    )
+
+    assert obs.is_error is False
+    assert obs.text == "Executed successfully with no output."
+    assert echo_executor.calls == [EchoAction(text="quiet")]
+
+
+def test_programmatic_tool_calling_includes_printed_tool_results(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+    echo_executor: EchoExecutor,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        'result = echo(text="printed")\nprint(result.text)',
+    )
+
+    assert obs.is_error is False
+    assert obs.text == "printed"
+    assert echo_executor.calls == [EchoAction(text="printed")]
 
 
 def test_programmatic_tool_calling_exposes_tools_namespace(

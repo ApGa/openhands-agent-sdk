@@ -9,7 +9,6 @@ import threading
 import traceback
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from IPython.terminal.embed import InteractiveShellEmbed
@@ -40,14 +39,6 @@ _RESERVED_NAMES = frozenset(
         "tools",
     }
 )
-
-
-@dataclass(slots=True)
-class _ToolCallRecord:
-    sequence: int
-    tool_name: str
-    arguments: dict[str, Any]
-    observation: Observation
 
 
 class _ToolFunction:
@@ -149,11 +140,8 @@ class ProgrammaticToolCallingExecutor(
         self._shell = self._create_shell()
         self._loop = asyncio.new_event_loop()
         self._lock = threading.RLock()
-        self._tool_call_lock = threading.RLock()
         self._resource_lock_manager = ResourceLockManager()
         self._conversation: LocalConversation | None = None
-        self._records: list[_ToolCallRecord] = []
-        self._next_tool_call_sequence = 0
         self._execution_count = 0
 
     def __call__(
@@ -178,8 +166,6 @@ class ProgrammaticToolCallingExecutor(
 
         with self._lock:
             self._conversation = conversation
-            self._records = []
-            self._next_tool_call_sequence = 0
             self._install_tool_namespace(conversation)
             self._execution_count += 1
 
@@ -212,7 +198,6 @@ class ProgrammaticToolCallingExecutor(
     def close(self) -> None:
         with self._lock:
             self._conversation = None
-            self._records = []
             if not self._loop.is_closed():
                 self._loop.close()
 
@@ -235,23 +220,9 @@ class ProgrammaticToolCallingExecutor(
         arguments = self._normalize_tool_arguments(args, kwargs)
         action = tool.action_from_arguments(arguments)
         lock_keys = self._resolve_lock_keys(tool, action)
-        with self._tool_call_lock:
-            sequence = self._next_tool_call_sequence
-            self._next_tool_call_sequence += 1
 
         with self._lock_tool_resources(lock_keys):
-            observation = tool(action, conversation)
-
-        with self._tool_call_lock:
-            self._records.append(
-                _ToolCallRecord(
-                    sequence=sequence,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    observation=observation,
-                )
-            )
-        return observation
+            return tool(action, conversation)
 
     async def acall_tool(
         self,
@@ -395,26 +366,12 @@ class ProgrammaticToolCallingExecutor(
         if result is not None:
             parts.append(f"Result:\n{result!r}")
 
-        if self._records:
-            parts.append(self._format_tool_call_records())
-
         if error is not None and not clean_stderr:
             parts.append("Traceback:\n" + "".join(traceback.format_exception(error)))
 
         if not parts:
             return "Executed successfully with no output."
         return "\n\n".join(parts)
-
-    def _format_tool_call_records(self) -> str:
-        lines = ["Tool calls:"]
-        records = sorted(self._records, key=lambda record: record.sequence)
-        for index, record in enumerate(records, start=1):
-            text = record.observation.text
-            if not text:
-                text = repr(record.observation.model_dump(exclude={"content"}))
-            text = maybe_truncate(text.strip(), truncate_after=2_000)
-            lines.append(f"{index}. {record.tool_name}({record.arguments!r}) -> {text}")
-        return "\n".join(lines)
 
     @staticmethod
     def _strip_ansi(text: str) -> str:
