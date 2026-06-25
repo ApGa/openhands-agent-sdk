@@ -18,12 +18,14 @@ def register_default_tools(enable_browser: bool = True) -> None:
     """Register the default set of tools."""
     # Tools are now automatically registered when imported
     from openhands.tools.file_editor import FileEditorTool
+    from openhands.tools.programmatic_tool_calling import ProgrammaticToolCallingTool
     from openhands.tools.task_tracker import TaskTrackerTool
     from openhands.tools.terminal import TerminalTool
 
     logger.debug(f"Tool: {TerminalTool.name} registered.")
     logger.debug(f"Tool: {FileEditorTool.name} registered.")
     logger.debug(f"Tool: {TaskTrackerTool.name} registered.")
+    logger.debug(f"Tool: {ProgrammaticToolCallingTool.name} registered.")
 
     if enable_browser:
         from openhands.tools.browser_use import BrowserToolSet
@@ -34,6 +36,7 @@ def register_default_tools(enable_browser: bool = True) -> None:
 def get_default_tools(
     enable_browser: bool = True,
     enable_sub_agents: bool = False,
+    enable_programmatic_tool_calling: bool = False,
 ) -> list[Tool]:
     """Get the default set of tool specifications for the standard experience.
 
@@ -41,6 +44,8 @@ def get_default_tools(
         enable_browser: Whether to include browser tools.
         enable_sub_agents: Whether to include the TaskToolSet for
             sub-agent delegation.
+        enable_programmatic_tool_calling: Whether to include the persistent
+            Python tool that can call other OpenHands tools programmatically.
     """
     register_default_tools(enable_browser=enable_browser)
 
@@ -62,6 +67,12 @@ def get_default_tools(
         from openhands.tools.task import TaskToolSet
 
         tools.append(Tool(name=TaskToolSet.name))
+    if enable_programmatic_tool_calling:
+        from openhands.tools.programmatic_tool_calling import (
+            ProgrammaticToolCallingTool,
+        )
+
+        tools.append(Tool(name=ProgrammaticToolCallingTool.name))
     return tools
 
 

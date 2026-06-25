@@ -26,6 +26,7 @@ from openhands.tools.preset.default import (
     register_builtins_agents,
     register_default_tools,
 )
+from openhands.tools.programmatic_tool_calling import ProgrammaticToolCallingTool
 from openhands.tools.task import TaskToolSet
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
@@ -42,6 +43,7 @@ __all__ = [
     "__version__",
     "DelegationVisualizer",
     "FileEditorTool",
+    "ProgrammaticToolCallingTool",
     "TaskToolSet",
     "TaskTrackerTool",
     "TerminalTool",

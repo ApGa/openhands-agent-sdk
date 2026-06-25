@@ -5,6 +5,7 @@ from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.glob import GlobTool
 from openhands.tools.grep import GrepTool
 from openhands.tools.planning_file_editor import PlanningFileEditorTool
+from openhands.tools.programmatic_tool_calling import ProgrammaticToolCallingTool
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
@@ -19,6 +20,7 @@ def test_tool_name_attributes_exist():
         GrepTool,
         GlobTool,
         PlanningFileEditorTool,
+        ProgrammaticToolCallingTool,
     ]
 
     for tool_class in tools:
@@ -49,6 +51,7 @@ def test_tool_name_consistency():
         GrepTool: "grep",
         GlobTool: "glob",
         PlanningFileEditorTool: "planning_file_editor",
+        ProgrammaticToolCallingTool: "programmatic_tool_calling",
     }
 
     for tool_class, expected_name in expected_names.items():
@@ -67,3 +70,4 @@ def test_tool_name_accessible_at_class_level():
     assert GrepTool.name == "grep"
     assert GlobTool.name == "glob"
     assert PlanningFileEditorTool.name == "planning_file_editor"
+    assert ProgrammaticToolCallingTool.name == "programmatic_tool_calling"

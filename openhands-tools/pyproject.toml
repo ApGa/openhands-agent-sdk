@@ -10,6 +10,7 @@ dependencies = [
     "tree-sitter-bash>=0.23",
     "binaryornot>=0.4.4",
     "cachetools",
+    "ipython>=8.26.0",
     "libtmux>=0.53.0",
     "pydantic>=2.11.7",
     "browser-use>=0.8.0",
