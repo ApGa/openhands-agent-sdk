@@ -228,7 +228,7 @@ def test_programmatic_tool_calling_supports_top_level_await(
     obs = run_code(
         executor,
         conversation,
-        'import asyncio\nawait asyncio.sleep(0)\n"async-ok"',
+        'await asyncio.sleep(0)\n"async-ok"',
     )
 
     assert obs.is_error is False
@@ -260,7 +260,6 @@ def test_programmatic_tool_calling_runs_async_tools_concurrently(
         executor,
         conversation,
         (
-            "import asyncio\n"
             "first, second = await asyncio.gather(\n"
             '    atools.concurrent_sleep(label="first"),\n'
             '    atools.concurrent_sleep(label="second"),\n'
@@ -284,7 +283,6 @@ def test_programmatic_tool_calling_serializes_undeclared_resource_tools(
         executor,
         conversation,
         (
-            "import asyncio\n"
             "first, second = await asyncio.gather(\n"
             '    atools.locked_sleep(label="first"),\n'
             '    atools.locked_sleep(label="second"),\n'

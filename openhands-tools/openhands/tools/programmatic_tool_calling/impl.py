@@ -290,6 +290,7 @@ class ProgrammaticToolCallingExecutor(
         shell.user_ns["atools"] = _AsyncToolNamespace(self)
         shell.user_ns["call_tool"] = self._call_tool_by_name
         shell.user_ns["acall_tool"] = self._acall_tool_by_name
+        shell.user_ns.setdefault("asyncio", asyncio)
         return shell
 
     def _run_cell(self, code: str) -> Any:
@@ -314,6 +315,7 @@ class ProgrammaticToolCallingExecutor(
         shell_ns["atools"] = _AsyncToolNamespace(self)
         shell_ns["call_tool"] = self._call_tool_by_name
         shell_ns["acall_tool"] = self._acall_tool_by_name
+        shell_ns.setdefault("asyncio", asyncio)
 
         for tool_name in conversation.agent.tools_map:
             if tool_name == self._tool_name:

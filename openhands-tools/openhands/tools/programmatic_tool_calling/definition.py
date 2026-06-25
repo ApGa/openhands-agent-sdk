@@ -32,6 +32,7 @@ All active OpenHands tools are available as Python callables:
 - Call `tools.available()` to list callable tools.
 - Use `await atools.<tool_name>(...)` or `await acall_tool("tool_name", ...)`
   when composing calls from async Python code.
+- `asyncio` is preloaded for concurrent orchestration.
 
 Tool functions accept keyword arguments matching the tool schema and return the
 tool's typed Observation object. For example:
@@ -40,7 +41,6 @@ tool's typed Observation object. For example:
 result = terminal(command="pwd")
 print(result.text)
 
-import asyncio
 results = await asyncio.gather(
     atools.glob(pattern="**/*.py"),
     atools.grep(pattern="ProgrammaticToolCallingTool"),
