@@ -115,17 +115,17 @@ class TaskManager:
         conversation are also ignored, but log a warning to surface potential
         programming errors where two subsystems try to register different parents.
         """
-        if (
-            self._parent_conversation is not None
-            and self._parent_conversation is not conversation
-        ):
-            logger.warning(
-                "attach_parent called with a different conversation; ignoring."
-            )
         self._ensure_parent(conversation)
 
     def _ensure_parent(self, conversation: LocalConversation) -> None:
-        if self._parent_conversation is None:
+        with self._tasks_lock:
+            if self._parent_conversation is not None:
+                if self._parent_conversation is not conversation:
+                    logger.warning(
+                        "attach_parent called with a different conversation; ignoring."
+                    )
+                return
+
             self._parent_conversation = conversation
             parent_persistence_dir = conversation.state.persistence_dir
             if parent_persistence_dir is not None:

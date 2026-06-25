@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -7,7 +9,13 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import Field
 
-from openhands.sdk.tool import Action, Observation, ToolDefinition, ToolExecutor
+from openhands.sdk.tool import (
+    Action,
+    DeclaredResources,
+    Observation,
+    ToolDefinition,
+    ToolExecutor,
+)
 from openhands.tools.programmatic_tool_calling import (
     ProgrammaticToolCallingAction,
     ProgrammaticToolCallingExecutor,
@@ -47,18 +55,92 @@ class EchoTool(ToolDefinition[EchoAction, EchoObservation]):
         return []
 
 
+class SleepAction(Action):
+    label: str
+    delay: float = Field(default=0.2, ge=0)
+
+
+class SleepObservation(Observation):
+    label: str
+
+
+class SleepExecutor(ToolExecutor[SleepAction, SleepObservation]):
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, action: SleepAction, conversation=None) -> SleepObservation:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append(action.label)
+        try:
+            time.sleep(action.delay)
+            return SleepObservation.from_text(action.label, label=action.label)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+class ConcurrentSleepTool(ToolDefinition[SleepAction, SleepObservation]):
+    name = "concurrent_sleep"
+
+    @classmethod
+    def create(cls, conv_state: ConversationState) -> Sequence[ConcurrentSleepTool]:
+        return []
+
+    def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
+        return DeclaredResources(keys=(), declared=True)
+
+
+class LockedSleepTool(ToolDefinition[SleepAction, SleepObservation]):
+    name = "locked_sleep"
+
+    @classmethod
+    def create(cls, conv_state: ConversationState) -> Sequence[LockedSleepTool]:
+        return []
+
+
 @pytest.fixture
 def echo_executor() -> EchoExecutor:
     return EchoExecutor()
 
 
 @pytest.fixture
-def conversation(echo_executor: EchoExecutor):
+def concurrent_sleep_executor() -> SleepExecutor:
+    return SleepExecutor()
+
+
+@pytest.fixture
+def locked_sleep_executor() -> SleepExecutor:
+    return SleepExecutor()
+
+
+@pytest.fixture
+def conversation(
+    echo_executor: EchoExecutor,
+    concurrent_sleep_executor: SleepExecutor,
+    locked_sleep_executor: SleepExecutor,
+):
     echo_tool = EchoTool(
         description="Echo text.",
         action_type=EchoAction,
         observation_type=EchoObservation,
         executor=echo_executor,
+    )
+    concurrent_sleep_tool = ConcurrentSleepTool(
+        description="Sleep without shared resources.",
+        action_type=SleepAction,
+        observation_type=SleepObservation,
+        executor=concurrent_sleep_executor,
+    )
+    locked_sleep_tool = LockedSleepTool(
+        description="Sleep with default tool-level locking.",
+        action_type=SleepAction,
+        observation_type=SleepObservation,
+        executor=locked_sleep_executor,
     )
     programmatic_tool = ProgrammaticToolCallingTool(
         description="Run persistent Python code that can call other tools.",
@@ -71,6 +153,8 @@ def conversation(echo_executor: EchoExecutor):
     agent = SimpleNamespace(
         tools_map={
             echo_tool.name: echo_tool,
+            concurrent_sleep_tool.name: concurrent_sleep_tool,
+            locked_sleep_tool.name: locked_sleep_tool,
             programmatic_tool.name: programmatic_tool,
         }
     )
@@ -165,6 +249,54 @@ def test_programmatic_tool_calling_exposes_async_tools(
     assert obs.is_error is False
     assert "async-ok" in obs.text
     assert echo_executor.calls == [EchoAction(text="async-ok")]
+
+
+def test_programmatic_tool_calling_runs_async_tools_concurrently(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+    concurrent_sleep_executor: SleepExecutor,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        (
+            "import asyncio\n"
+            "first, second = await asyncio.gather(\n"
+            '    atools.concurrent_sleep(label="first"),\n'
+            '    atools.concurrent_sleep(label="second"),\n'
+            ")\n"
+            "(first.label, second.label)"
+        ),
+    )
+
+    assert obs.is_error is False
+    assert "first" in obs.text
+    assert "second" in obs.text
+    assert concurrent_sleep_executor.max_active == 2
+
+
+def test_programmatic_tool_calling_serializes_undeclared_resource_tools(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+    locked_sleep_executor: SleepExecutor,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        (
+            "import asyncio\n"
+            "first, second = await asyncio.gather(\n"
+            '    atools.locked_sleep(label="first"),\n'
+            '    atools.locked_sleep(label="second"),\n'
+            ")\n"
+            "(first.label, second.label)"
+        ),
+    )
+
+    assert obs.is_error is False
+    assert "first" in obs.text
+    assert "second" in obs.text
+    assert locked_sleep_executor.max_active == 1
 
 
 def test_programmatic_tool_calling_rejects_recursive_self_call(
