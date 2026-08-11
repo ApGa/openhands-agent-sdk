@@ -417,6 +417,7 @@ class ProgrammaticToolCallingExecutor(
         conversation: LocalConversation,
         tool_name: str,
     ) -> ToolDefinition:
+        self._require_string_tool_name(tool_name)
         if tool_name == self._tool_name:
             raise ValueError("programmatic_tool_calling cannot call itself.")
 
@@ -424,6 +425,24 @@ class ProgrammaticToolCallingExecutor(
         if tool is None:
             raise ToolNotFoundError(tool_name, self.available_tool_names())
         return tool
+
+    def _require_string_tool_name(self, tool_name: object) -> None:
+        if isinstance(tool_name, str):
+            return
+
+        message = (
+            "An OpenHands tool name must be a string; received "
+            f"{type(tool_name).__name__}. The bare `call_tool(...)` and "
+            "`acall_tool(...)` helpers expect a direct OpenHands tool name, for "
+            "example `call_tool(\"<tool_name>\", **arguments)`."
+        )
+        if "call_tool" in self.available_tool_names():
+            message += (
+                " An OpenHands tool also named `call_tool` is available. To pass "
+                "a request mapping to that tool, use `tools.call_tool({...})` or "
+                "`await atools.call_tool({...})`."
+            )
+        raise TypeError(message)
 
     @staticmethod
     def _resolve_lock_keys(tool: ToolDefinition, action: Action) -> list[str]:
@@ -588,7 +607,9 @@ class ProgrammaticToolCallingExecutor(
             text += "\nCorrective guidance:\n" + execution_error.guidance
         self._record_nested_tool_error(tool_name, text)
 
-    def _record_nested_tool_error(self, tool_name: str, text: str) -> None:
+    def _record_nested_tool_error(self, tool_name: object, text: str) -> None:
+        if not isinstance(tool_name, str):
+            tool_name = f"<invalid {type(tool_name).__name__} tool name>"
         with self._nested_error_lock:
             self._nested_tool_errors.append(
                 _NestedToolError(tool_name=tool_name, text=text)

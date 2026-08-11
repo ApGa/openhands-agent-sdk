@@ -463,6 +463,42 @@ def test_programmatic_tool_calling_rejects_positional_tool_args(
     assert "keyword arguments" in obs.text
 
 
+def test_bare_call_tool_rejects_request_mapping_with_dispatcher_guidance(
+    executor: ProgrammaticToolCallingExecutor,
+    catalog_conversation,
+) -> None:
+    obs = run_code(
+        executor,
+        catalog_conversation,
+        'await call_tool({"name": "catalog.echo", "arguments": {}})',
+    )
+
+    assert obs.is_error is True
+    assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+    assert obs.failed_tool_names == ("<invalid dict tool name>",)
+    assert "An OpenHands tool name must be a string; received dict" in obs.text
+    assert "`tools.call_tool({...})`" in obs.text
+    assert "`await atools.call_tool({...})`" in obs.text
+    assert "unhashable type" not in obs.text
+
+
+def test_bare_call_tool_uses_generic_guidance_without_dispatcher(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        'call_tool({"name": "echo", "arguments": {}})',
+    )
+
+    assert obs.is_error is True
+    assert obs.failed_tool_names == ("<invalid dict tool name>",)
+    assert 'call_tool("<tool_name>", **arguments)' in obs.text
+    nested_feedback = obs.text.split("Nested tool call errors:\n", 1)[1]
+    assert "`tools.call_tool({...})`" not in nested_feedback
+
+
 @pytest.mark.parametrize(
     "code",
     [
