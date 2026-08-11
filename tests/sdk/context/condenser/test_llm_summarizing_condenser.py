@@ -261,6 +261,28 @@ def test_get_condensation_does_not_pass_extra_body(mock_llm: LLM) -> None:
     assert completion_mock.call_count == 1
 
 
+def test_summarizing_prompt_is_a_generic_continuation_checkpoint(
+    mock_llm: LLM,
+) -> None:
+    """The native prompt should preserve broad handoff state without task anchors."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+
+    condenser._generate_condensation(
+        forgotten_events=[message_event("Investigate the current failure")],
+        summary_offset=0,
+    )
+
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    prompt = completion_mock.call_args.kwargs["messages"][0].content[0].text
+    assert "another agent that will resume this trajectory" in prompt
+    assert "KEY_DECISIONS:" in prompt
+    assert "CRITICAL_CONTEXT:" in prompt
+    assert "Do not continue the task" in prompt
+    assert "Investigate the current failure" in prompt
+    assert "FITS card" not in prompt
+    assert "haikus" not in prompt
+
+
 def test_condense_with_agent_llm(mock_llm: LLM) -> None:
     """Test that condenser accepts and works with optional agent llm parameter."""
     condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
