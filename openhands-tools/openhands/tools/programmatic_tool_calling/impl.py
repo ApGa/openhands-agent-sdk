@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import keyword
+import math
 import re
 import sys
 import threading
@@ -19,6 +20,7 @@ from openhands.sdk.conversation.resource_lock_manager import ResourceLockManager
 from openhands.sdk.tool import Observation, ToolExecutor
 from openhands.sdk.utils import maybe_truncate
 from openhands.tools.programmatic_tool_calling.definition import (
+    DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS,
     ProgrammaticToolCallingAction,
     ProgrammaticToolCallingErrorKind,
     ProgrammaticToolCallingMode,
@@ -60,6 +62,15 @@ class ToolNotFoundError(LookupError):
         super().__init__(
             f"Tool '{tool_name}' not found. Available tools: "
             f"{list(available_tool_names)}"
+        )
+
+
+class _CellExecutionTimeoutError(TimeoutError):
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            "Programmatic tool execution exceeded its "
+            f"{timeout_seconds:g}-second time limit and was canceled."
         )
 
 
@@ -178,9 +189,20 @@ class ProgrammaticToolCallingExecutor(
         mode: ProgrammaticToolCallingMode | str = (
             ProgrammaticToolCallingMode.UNRESTRICTED
         ),
+        execution_timeout_seconds: float = (
+            DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+        ),
     ):
+        if (
+            isinstance(execution_timeout_seconds, bool)
+            or not isinstance(execution_timeout_seconds, int | float)
+            or not math.isfinite(execution_timeout_seconds)
+            or execution_timeout_seconds <= 0
+        ):
+            raise ValueError("execution_timeout_seconds must be a positive number")
         self._tool_name = tool_name
         self._mode = ProgrammaticToolCallingMode(mode)
+        self._execution_timeout_seconds = float(execution_timeout_seconds)
         self._shell = self._create_shell()
         self._loop = asyncio.new_event_loop()
         self._lock = threading.RLock()
@@ -214,6 +236,7 @@ class ProgrammaticToolCallingExecutor(
             )
 
         with self._lock:
+            orphaned_task_count = self._cancel_and_drain_pending_tasks()
             self._conversation = conversation
             self._install_tool_namespace(conversation)
             with self._nested_error_lock:
@@ -225,31 +248,53 @@ class ProgrammaticToolCallingExecutor(
             execution_error = _ExecutionError()
             try:
                 with redirect_stdout(stdout), redirect_stderr(stderr):
-                    result = self._run_cell(code)
+                    result, cell_orphaned_task_count = self._run_cell(code)
+                orphaned_task_count += cell_orphaned_task_count
 
                 python_error = getattr(result, "error_before_exec", None) or getattr(
                     result, "error_in_exec", None
                 )
+                self._consume_future_exceptions_from_traceback(python_error)
                 execution_error = self._classify_error(python_error)
+                orphaned_task_guidance = self._orphaned_task_guidance(
+                    orphaned_task_count
+                )
                 nested_tool_errors = self._nested_errors_snapshot()
                 output = self._format_output(
                     stdout=stdout.getvalue(),
                     stderr=stderr.getvalue(),
                     result=getattr(result, "result", None),
                     error=python_error,
-                    guidance=execution_error.guidance,
+                    guidance=self._join_guidance(
+                        execution_error.guidance,
+                        orphaned_task_guidance,
+                    ),
                     nested_tool_errors=nested_tool_errors,
                 )
-                is_error = not getattr(result, "success", False) or bool(
-                    nested_tool_errors
+                is_error = (
+                    not getattr(result, "success", False)
+                    or bool(nested_tool_errors)
+                    or bool(orphaned_task_count)
                 )
                 if nested_tool_errors and execution_error.kind is None:
                     execution_error = _ExecutionError(
                         kind=ProgrammaticToolCallingErrorKind.TOOL_ERROR
                     )
+                if orphaned_task_count and execution_error.kind is None:
+                    execution_error = _ExecutionError(
+                        kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+                    )
             except BaseException as exc:
+                orphaned_task_count += self._cancel_and_drain_pending_tasks()
                 execution_error = self._classify_error(exc)
-                output = self._format_caught_exception(exc, execution_error.guidance)
+                self._consume_future_exceptions_from_traceback(exc)
+                output = self._format_caught_exception(
+                    exc,
+                    self._join_guidance(
+                        execution_error.guidance,
+                        self._orphaned_task_guidance(orphaned_task_count),
+                    ),
+                )
                 nested_tool_errors = self._nested_errors_snapshot()
                 is_error = True
             finally:
@@ -277,10 +322,15 @@ class ProgrammaticToolCallingExecutor(
     def mode(self) -> ProgrammaticToolCallingMode:
         return self._mode
 
+    @property
+    def execution_timeout_seconds(self) -> float:
+        return self._execution_timeout_seconds
+
     def close(self) -> None:
         with self._lock:
             self._conversation = None
             if not self._loop.is_closed():
+                self._cancel_and_drain_pending_tasks()
                 self._loop.close()
 
     def call_tool(
@@ -357,7 +407,7 @@ class ProgrammaticToolCallingExecutor(
         shell.user_ns.setdefault("asyncio", asyncio)
         return shell
 
-    def _run_cell(self, code: str) -> Any:
+    def _run_cell(self, code: str) -> tuple[Any, int]:
         preprocessing_exc_tuple = None
         try:
             transformed_cell = self._shell.transform_cell(code)
@@ -369,7 +419,32 @@ class ProgrammaticToolCallingExecutor(
                 transformed_cell if transformed_cell is not None else code,
                 self.available_tool_names(),
             )
-        return self._loop.run_until_complete(
+        try:
+            result = self._loop.run_until_complete(
+                self._run_cell_with_timeout(
+                    code,
+                    transformed_cell,
+                    preprocessing_exc_tuple,
+                )
+            )
+        finally:
+            # User code can schedule work without awaiting it. Do not let that work
+            # resume under a later action's conversation and execute tools there.
+            conversation = self._conversation
+            self._conversation = None
+            try:
+                orphaned_task_count = self._cancel_and_drain_pending_tasks()
+            finally:
+                self._conversation = conversation
+        return result, orphaned_task_count
+
+    async def _run_cell_with_timeout(
+        self,
+        code: str,
+        transformed_cell: str | None,
+        preprocessing_exc_tuple: Any,
+    ) -> Any:
+        cell_task = asyncio.create_task(
             self._shell.run_cell_async(
                 code,
                 store_history=True,
@@ -377,6 +452,73 @@ class ProgrammaticToolCallingExecutor(
                 preprocessing_exc_tuple=preprocessing_exc_tuple,
             )
         )
+        done, _ = await asyncio.wait(
+            (cell_task,),
+            timeout=self._execution_timeout_seconds,
+        )
+        if cell_task in done:
+            return cell_task.result()
+
+        cell_task.cancel()
+        await asyncio.gather(cell_task, return_exceptions=True)
+        raise _CellExecutionTimeoutError(self._execution_timeout_seconds)
+
+    def _cancel_and_drain_pending_tasks(self) -> int:
+        """Cancel tasks left on this executor's private loop and retrieve results."""
+        if self._loop.is_closed():
+            return 0
+
+        pending = tuple(asyncio.all_tasks(self._loop))
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        return len(pending)
+
+    def _consume_future_exceptions_from_traceback(
+        self,
+        error: BaseException | None,
+    ) -> None:
+        """Retrieve abandoned same-loop Future errors retained by a traceback."""
+        if error is None:
+            return
+
+        traceback_frame = error.__traceback__
+        seen: set[int] = set()
+        while traceback_frame is not None:
+            for value in traceback_frame.tb_frame.f_locals.values():
+                if not isinstance(value, asyncio.Future) or id(value) in seen:
+                    continue
+                seen.add(id(value))
+                if value.get_loop() is not self._loop or not value.done():
+                    continue
+                try:
+                    value.exception()
+                except BaseException:
+                    # Retrieving a cancelled Future raises CancelledError. The call
+                    # still marks it handled, which is all cleanup requires here.
+                    pass
+            traceback_frame = traceback_frame.tb_next
+
+    @staticmethod
+    def _orphaned_task_guidance(orphaned_task_count: int) -> str | None:
+        if not orphaned_task_count:
+            return None
+        noun = "task" if orphaned_task_count == 1 else "tasks"
+        return (
+            f"Canceled {orphaned_task_count} background asyncio {noun} left "
+            "running by this cell. Await all asynchronous work before the cell "
+            "ends. Use top-level `await` (for example, "
+            "`await asyncio.gather(...)`) instead of `asyncio.run(...)` or an "
+            "unawaited `asyncio.create_task(...)`."
+        )
+
+    @staticmethod
+    def _join_guidance(*parts: str | None) -> str | None:
+        guidance = [part for part in parts if part]
+        return "\n".join(guidance) or None
 
     def _install_tool_namespace(self, conversation: LocalConversation) -> None:
         shell_ns = self._shell.user_ns
@@ -434,7 +576,7 @@ class ProgrammaticToolCallingExecutor(
             "An OpenHands tool name must be a string; received "
             f"{type(tool_name).__name__}. The bare `call_tool(...)` and "
             "`acall_tool(...)` helpers expect a direct OpenHands tool name, for "
-            "example `call_tool(\"<tool_name>\", **arguments)`."
+            'example `call_tool("<tool_name>", **arguments)`.'
         )
         if "call_tool" in self.available_tool_names():
             message += (
@@ -508,6 +650,15 @@ class ProgrammaticToolCallingExecutor(
     def _classify_error(self, error: BaseException | None) -> _ExecutionError:
         if error is None:
             return _ExecutionError()
+        if isinstance(error, _CellExecutionTimeoutError):
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
+                guidance=(
+                    "Keep loops bounded with an explicit iteration limit or "
+                    "terminating condition, and await all asynchronous work "
+                    "before the cell ends."
+                ),
+            )
         if isinstance(error, OrchestrationPolicyError):
             routes = self._routing_index.for_capabilities(error.capabilities)
             return _ExecutionError(
@@ -584,7 +735,7 @@ class ProgrammaticToolCallingExecutor(
         error: BaseException,
         guidance: str | None,
     ) -> str:
-        if isinstance(error, OrchestrationPolicyError):
+        if isinstance(error, OrchestrationPolicyError | _CellExecutionTimeoutError):
             output = str(error)
         else:
             output = "Traceback:\n" + "".join(traceback.format_exception(error))

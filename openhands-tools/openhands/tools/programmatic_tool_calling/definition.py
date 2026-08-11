@@ -62,6 +62,8 @@ local-access patterns; it is not a security sandbox. Local access remains
 unsupported even when a Python escape is not intercepted.
 """
 
+DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS = 300.0
+
 
 class ProgrammaticToolCallingMode(StrEnum):
     UNRESTRICTED = "unrestricted"
@@ -140,6 +142,9 @@ class ProgrammaticToolCallingTool(
         mode: ProgrammaticToolCallingMode | str = (
             ProgrammaticToolCallingMode.UNRESTRICTED
         ),
+        execution_timeout_seconds: float = (
+            DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+        ),
     ) -> Sequence["ProgrammaticToolCallingTool"]:
         _ = conv_state
         from openhands.tools.programmatic_tool_calling.impl import (
@@ -147,9 +152,20 @@ class ProgrammaticToolCallingTool(
         )
 
         execution_mode = ProgrammaticToolCallingMode(mode)
+        executor = ProgrammaticToolCallingExecutor(
+            tool_name=cls.name,
+            mode=execution_mode,
+            execution_timeout_seconds=execution_timeout_seconds,
+        )
         description = TOOL_DESCRIPTION
         if execution_mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
             description += ORCHESTRATION_ONLY_DESCRIPTION
+        description += (
+            "\nEach program must finish within "
+            f"{executor.execution_timeout_seconds:g} seconds. "
+            "Keep loops bounded with an explicit iteration limit or terminating "
+            "condition.\n"
+        )
 
         return [
             cls(
@@ -163,10 +179,7 @@ class ProgrammaticToolCallingTool(
                     idempotentHint=False,
                     openWorldHint=True,
                 ),
-                executor=ProgrammaticToolCallingExecutor(
-                    tool_name=cls.name,
-                    mode=execution_mode,
-                ),
+                executor=executor,
             )
         ]
 

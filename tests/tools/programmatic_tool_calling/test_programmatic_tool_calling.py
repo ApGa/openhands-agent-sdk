@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import gc
 import threading
 import time
 from collections.abc import Sequence
@@ -14,10 +16,13 @@ from openhands.sdk.tool import (
     Action,
     DeclaredResources,
     Observation,
+    Tool,
     ToolDefinition,
     ToolExecutor,
+    resolve_tool,
 )
 from openhands.tools.programmatic_tool_calling import (
+    DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS,
     ProgrammaticToolCallingAction,
     ProgrammaticToolCallingErrorKind,
     ProgrammaticToolCallingExecutor,
@@ -416,6 +421,146 @@ def test_programmatic_tool_calling_runs_async_tools_concurrently(
     assert concurrent_sleep_executor.max_active == 2
 
 
+def test_programmatic_tool_calling_times_out_and_cancels_infinite_async_loop(
+    conversation,
+    concurrent_sleep_executor: SleepExecutor,
+) -> None:
+    timeout_executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        execution_timeout_seconds=0.05,
+    )
+    try:
+        started = time.monotonic()
+        obs = run_code(
+            timeout_executor,
+            conversation,
+            (
+                "try:\n"
+                '    tools["does_not_exist"]()\n'
+                "except LookupError:\n"
+                "    pass\n"
+                "while True:\n"
+                "    await atools.concurrent_sleep(label='loop', delay=0.01)"
+            ),
+        )
+        elapsed = time.monotonic() - started
+
+        assert obs.is_error is True
+        assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+        assert (
+            "Programmatic tool execution exceeded its 0.05-second time limit"
+            in obs.text
+        )
+        assert "Keep loops bounded" in obs.text
+        assert obs.failed_tool_names == ("does_not_exist",)
+        assert elapsed < 5
+
+        calls_at_timeout = len(concurrent_sleep_executor.calls)
+        time.sleep(0.1)
+        assert len(concurrent_sleep_executor.calls) == calls_at_timeout
+
+        follow_up = run_code(timeout_executor, conversation, '"after-timeout"')
+        assert follow_up.is_error is False
+        assert "after-timeout" in follow_up.text
+        assert len(concurrent_sleep_executor.calls) == calls_at_timeout
+    finally:
+        timeout_executor.close()
+
+
+def test_programmatic_tool_calling_cancels_tasks_abandoned_by_asyncio_run(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+    echo_executor: EchoExecutor,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        (
+            "async def delayed_echo():\n"
+            "    await asyncio.sleep(0.05)\n"
+            '    echo(text="leaked")\n'
+            "asyncio.run(asyncio.gather(delayed_echo()))"
+        ),
+    )
+
+    assert obs.is_error is True
+    assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+    assert "asyncio.run() cannot be called from a running event loop" in obs.text
+    assert "Canceled 1 background asyncio task" in obs.text
+    assert "Use top-level `await`" in obs.text
+
+    follow_up = run_code(
+        executor,
+        conversation,
+        'await asyncio.sleep(0.1)\n"next-cell"',
+    )
+
+    assert follow_up.is_error is False
+    assert "next-cell" in follow_up.text
+    assert echo_executor.calls == []
+
+
+def test_programmatic_tool_calling_marks_unawaited_tasks_as_errors(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+) -> None:
+    obs = run_code(
+        executor,
+        conversation,
+        (
+            "async def background():\n"
+            "    await asyncio.sleep(60)\n"
+            "asyncio.create_task(background())\n"
+            '"scheduled"'
+        ),
+    )
+
+    assert obs.is_error is True
+    assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+    assert "Canceled 1 background asyncio task" in obs.text
+    assert "await asyncio.gather(...)" in obs.text
+    assert not executor._loop.is_closed()
+    assert not executor._loop.run_until_complete(_pending_tasks())
+
+
+async def _pending_tasks() -> set:
+    current = asyncio.current_task()
+    return {task for task in asyncio.all_tasks() if task is not current}
+
+
+def test_programmatic_tool_calling_consumes_abandoned_gather_errors(
+    executor: ProgrammaticToolCallingExecutor,
+    conversation,
+) -> None:
+    loop_errors: list[dict] = []
+    executor._loop.set_exception_handler(
+        lambda _loop, context: loop_errors.append(context)
+    )
+
+    obs = run_code(
+        executor,
+        conversation,
+        (
+            "async def missing_tool():\n"
+            '    tools["does_not_exist"]()\n'
+            "asyncio.run(asyncio.gather(missing_tool()))"
+        ),
+    )
+
+    assert obs.is_error is True
+    assert "asyncio.run() cannot be called from a running event loop" in obs.text
+    assert "ToolNotFoundError" in obs.text
+    assert obs.failed_tool_names == ("does_not_exist",)
+
+    run_code(executor, conversation, '"release-previous-traceback"')
+    gc.collect()
+
+    assert not any(
+        "exception was never retrieved" in context.get("message", "").lower()
+        for context in loop_errors
+    )
+
+
 def test_programmatic_tool_calling_serializes_undeclared_resource_tools(
     executor: ProgrammaticToolCallingExecutor,
     conversation,
@@ -725,14 +870,48 @@ def test_caught_nested_exceptions_still_mark_outer_observation_as_error(
 
 
 def test_tool_factory_configures_orchestration_only_mode() -> None:
-    tool = ProgrammaticToolCallingTool.create(
-        conv_state=cast("ConversationState", SimpleNamespace()),
-        mode="orchestration_only",
+    tool = resolve_tool(
+        Tool(
+            name=ProgrammaticToolCallingTool.name,
+            params={
+                "mode": "orchestration_only",
+                "execution_timeout_seconds": 12.5,
+            },
+        ),
+        cast("ConversationState", SimpleNamespace()),
     )[0]
 
     assert isinstance(tool.executor, ProgrammaticToolCallingExecutor)
     assert tool.executor.mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY
+    assert tool.executor.execution_timeout_seconds == 12.5
     assert "outside the task environment" in tool.description
+    assert "finish within 12.5 seconds" in tool.description
+
+
+def test_programmatic_tool_calling_default_timeout(
+    executor: ProgrammaticToolCallingExecutor,
+) -> None:
+    assert (
+        executor.execution_timeout_seconds
+        == DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.parametrize(
+    "execution_timeout_seconds",
+    [0, -1, float("inf"), float("nan"), True, "5"],
+)
+def test_programmatic_tool_calling_rejects_invalid_timeout(
+    execution_timeout_seconds,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="execution_timeout_seconds must be a positive number",
+    ):
+        ProgrammaticToolCallingExecutor(
+            tool_name=ProgrammaticToolCallingTool.name,
+            execution_timeout_seconds=execution_timeout_seconds,
+        )
 
 
 def test_default_preset_keeps_programmatic_tool_calling_opt_in() -> None:
