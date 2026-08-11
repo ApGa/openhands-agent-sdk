@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import io
 import keyword
-import math
+import logging
 import re
 import sys
 import threading
 import traceback
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -20,7 +21,7 @@ from openhands.sdk.conversation.resource_lock_manager import ResourceLockManager
 from openhands.sdk.tool import Observation, ToolExecutor
 from openhands.sdk.utils import maybe_truncate
 from openhands.tools.programmatic_tool_calling.definition import (
-    DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS,
+    DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS,
     ProgrammaticToolCallingAction,
     ProgrammaticToolCallingErrorKind,
     ProgrammaticToolCallingMode,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 
 MAX_PROGRAMMATIC_TOOL_OUTPUT_SIZE = 50_000
+logger = logging.getLogger(__name__)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _IPYTHON_OUT_PROMPT_RE = re.compile(r"^Out\[\d+\]: ?")
 _RESERVED_NAMES = frozenset(
@@ -65,13 +67,108 @@ class ToolNotFoundError(LookupError):
         )
 
 
-class _CellExecutionTimeoutError(TimeoutError):
-    def __init__(self, timeout_seconds: float):
-        self.timeout_seconds = timeout_seconds
+class _ToolCallBudgetExceededError(BaseException):
+    def __init__(self, max_tool_calls: int, tool_name: object):
+        self.max_tool_calls = max_tool_calls
+        self.tool_name = tool_name
         super().__init__(
-            "Programmatic tool execution exceeded its "
-            f"{timeout_seconds:g}-second time limit and was canceled."
+            "Programmatic tool execution exceeded its per-cell budget of "
+            f"{max_tool_calls} direct OpenHands tool-call attempts."
         )
+
+
+class _ToolCallAdmissionsClosedError(BaseException):
+    def __init__(self, tool_name: object):
+        self.tool_name = tool_name
+        super().__init__(
+            "This programmatic tool cell is already finishing and no longer "
+            "accepts direct OpenHands tool calls."
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CellCallTelemetry:
+    limit: int
+    attempts: int
+    admitted: int
+    completed: int
+    rejected: int
+    limit_reached: bool
+
+
+class _CellCallState:
+    """Per-cell admissions and liveness state shared with nested-call workers."""
+
+    __slots__ = (
+        "_accepting",
+        "_active",
+        "_admitted",
+        "_attempts",
+        "_completed",
+        "_condition",
+        "_limit_reached",
+        "_max_tool_calls",
+        "_rejected",
+    )
+
+    def __init__(self, max_tool_calls: int):
+        self._max_tool_calls = max_tool_calls
+        self._condition = threading.Condition()
+        self._accepting = True
+        self._attempts = 0
+        self._admitted = 0
+        self._completed = 0
+        self._rejected = 0
+        self._active = 0
+        self._limit_reached = False
+
+    @property
+    def exhausted(self) -> bool:
+        with self._condition:
+            return self._limit_reached
+
+    def begin(self, tool_name: object) -> None:
+        with self._condition:
+            self._attempts += 1
+            if not self._accepting:
+                self._rejected += 1
+                raise _ToolCallAdmissionsClosedError(tool_name)
+            if self._admitted >= self._max_tool_calls:
+                self._rejected += 1
+                self._limit_reached = True
+                raise _ToolCallBudgetExceededError(
+                    self._max_tool_calls,
+                    tool_name,
+                )
+            self._admitted += 1
+            self._active += 1
+
+    def finish(self) -> None:
+        with self._condition:
+            self._active -= 1
+            self._completed += 1
+            if not self._active:
+                self._condition.notify_all()
+
+    def close_admissions(self) -> None:
+        with self._condition:
+            self._accepting = False
+
+    def wait_until_idle(self) -> None:
+        with self._condition:
+            while self._active:
+                self._condition.wait()
+
+    def telemetry(self) -> _CellCallTelemetry:
+        with self._condition:
+            return _CellCallTelemetry(
+                limit=self._max_tool_calls,
+                attempts=self._attempts,
+                admitted=self._admitted,
+                completed=self._completed,
+                rejected=self._rejected,
+                limit_reached=self._limit_reached,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +226,6 @@ class _ToolNamespace:
         return self[tool_name]
 
     def __getitem__(self, tool_name: str) -> _ToolFunction:
-        self._executor.require_tool_available(tool_name)
         return _ToolFunction(self._executor, tool_name)
 
     def __dir__(self) -> list[str]:
@@ -157,7 +253,6 @@ class _AsyncToolNamespace:
         return self[tool_name]
 
     def __getitem__(self, tool_name: str) -> _AsyncToolFunction:
-        self._executor.require_tool_available(tool_name)
         return _AsyncToolFunction(self._executor, tool_name)
 
     def __dir__(self) -> list[str]:
@@ -189,24 +284,27 @@ class ProgrammaticToolCallingExecutor(
         mode: ProgrammaticToolCallingMode | str = (
             ProgrammaticToolCallingMode.UNRESTRICTED
         ),
-        execution_timeout_seconds: float = (
-            DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+        max_tool_calls_per_execution: int = (
+            DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS
         ),
     ):
         if (
-            isinstance(execution_timeout_seconds, bool)
-            or not isinstance(execution_timeout_seconds, int | float)
-            or not math.isfinite(execution_timeout_seconds)
-            or execution_timeout_seconds <= 0
+            isinstance(max_tool_calls_per_execution, bool)
+            or not isinstance(max_tool_calls_per_execution, int)
+            or max_tool_calls_per_execution <= 0
         ):
-            raise ValueError("execution_timeout_seconds must be a positive number")
+            raise ValueError("max_tool_calls_per_execution must be a positive integer")
         self._tool_name = tool_name
         self._mode = ProgrammaticToolCallingMode(mode)
-        self._execution_timeout_seconds = float(execution_timeout_seconds)
+        self._max_tool_calls_per_execution = max_tool_calls_per_execution
         self._shell = self._create_shell()
         self._loop = asyncio.new_event_loop()
+        self._tool_thread_pool = ThreadPoolExecutor(
+            thread_name_prefix="openhands-ptc-tool"
+        )
         self._lock = threading.RLock()
         self._nested_error_lock = threading.Lock()
+        self._cell_call_state: _CellCallState | None = None
         self._resource_lock_manager = ResourceLockManager()
         self._conversation: LocalConversation | None = None
         self._routing_index = ToolRoutingIndex(routes=(), available_tool_names=())
@@ -218,12 +316,15 @@ class ProgrammaticToolCallingExecutor(
         action: ProgrammaticToolCallingAction,
         conversation: LocalConversation | None = None,
     ) -> ProgrammaticToolCallingObservation:
+        with self._lock:
+            execution_count = self._execution_count
         if conversation is None:
             return ProgrammaticToolCallingObservation.from_text(
                 "programmatic_tool_calling requires a LocalConversation context.",
                 is_error=True,
-                execution_count=self._execution_count,
+                execution_count=execution_count,
                 error_kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
+                tool_call_limit=self._max_tool_calls_per_execution,
             )
 
         code = action.code.strip()
@@ -231,17 +332,21 @@ class ProgrammaticToolCallingExecutor(
             return ProgrammaticToolCallingObservation.from_text(
                 "No Python code was provided.",
                 is_error=True,
-                execution_count=self._execution_count,
+                execution_count=execution_count,
                 error_kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
+                tool_call_limit=self._max_tool_calls_per_execution,
             )
 
         with self._lock:
             orphaned_task_count = self._cancel_and_drain_pending_tasks()
+            cell_call_state = _CellCallState(self._max_tool_calls_per_execution)
+            self._cell_call_state = cell_call_state
             self._conversation = conversation
             self._install_tool_namespace(conversation)
             with self._nested_error_lock:
                 self._nested_tool_errors.clear()
             self._execution_count += 1
+            execution_count = self._execution_count
 
             stdout = io.StringIO()
             stderr = io.StringIO()
@@ -278,7 +383,11 @@ class ProgrammaticToolCallingExecutor(
                 )
                 if nested_tool_errors and execution_error.kind is None:
                     execution_error = _ExecutionError(
-                        kind=ProgrammaticToolCallingErrorKind.TOOL_ERROR
+                        kind=(
+                            ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+                            if cell_call_state.exhausted
+                            else ProgrammaticToolCallingErrorKind.TOOL_ERROR
+                        )
                     )
                 if orphaned_task_count and execution_error.kind is None:
                     execution_error = _ExecutionError(
@@ -298,11 +407,16 @@ class ProgrammaticToolCallingExecutor(
                 nested_tool_errors = self._nested_errors_snapshot()
                 is_error = True
             finally:
+                # _run_cell closes admissions, cancels async wrappers, and waits
+                # for every admitted worker before control can reach this point.
                 self._conversation = None
+                self._cell_call_state = None
                 self._routing_index = ToolRoutingIndex(
                     routes=(), available_tool_names=()
                 )
 
+        telemetry = cell_call_state.telemetry()
+        self._log_cell_telemetry(execution_count, telemetry)
         failed_tool_names = tuple(
             dict.fromkeys(error.tool_name for error in nested_tool_errors)
         )
@@ -310,12 +424,18 @@ class ProgrammaticToolCallingExecutor(
         return ProgrammaticToolCallingObservation.from_text(
             maybe_truncate(output, truncate_after=MAX_PROGRAMMATIC_TOOL_OUTPUT_SIZE),
             is_error=is_error,
-            execution_count=self._execution_count,
+            execution_count=execution_count,
             error_kind=execution_error.kind,
             policy_violation=execution_error.policy_violation,
             missing_symbol=execution_error.missing_symbol,
             suggested_routes=execution_error.suggested_routes,
             failed_tool_names=failed_tool_names,
+            tool_call_limit=telemetry.limit,
+            tool_call_attempts=telemetry.attempts,
+            tool_calls_admitted=telemetry.admitted,
+            tool_calls_completed=telemetry.completed,
+            tool_calls_rejected=telemetry.rejected,
+            tool_call_limit_reached=telemetry.limit_reached,
         )
 
     @property
@@ -323,14 +443,22 @@ class ProgrammaticToolCallingExecutor(
         return self._mode
 
     @property
-    def execution_timeout_seconds(self) -> float:
-        return self._execution_timeout_seconds
+    def max_tool_calls_per_execution(self) -> int:
+        return self._max_tool_calls_per_execution
 
     def close(self) -> None:
         with self._lock:
-            self._conversation = None
+            cell_call_state = self._cell_call_state
+            if cell_call_state is not None:
+                cell_call_state.close_admissions()
             if not self._loop.is_closed():
                 self._cancel_and_drain_pending_tasks()
+                if cell_call_state is not None:
+                    cell_call_state.wait_until_idle()
+                    self._flush_loop_callbacks()
+                self._conversation = None
+                self._cell_call_state = None
+                self._tool_thread_pool.shutdown(wait=True, cancel_futures=False)
                 self._loop.close()
 
     def call_tool(
@@ -339,13 +467,80 @@ class ProgrammaticToolCallingExecutor(
         args: Sequence[Any],
         kwargs: Mapping[str, Any],
     ) -> Observation:
-        conversation = self._conversation
-        if conversation is None:
-            raise RuntimeError("OpenHands tools can only be called during execution.")
+        conversation, cell_call_state = self._current_call_context()
         try:
-            if tool_name == self._tool_name:
-                raise ValueError("programmatic_tool_calling cannot call itself.")
+            cell_call_state.begin(tool_name)
+        except (
+            _ToolCallBudgetExceededError,
+            _ToolCallAdmissionsClosedError,
+        ) as exc:
+            self._record_nested_exception(tool_name, exc)
+            raise
+        try:
+            return self._execute_tool_call(
+                conversation,
+                tool_name,
+                args,
+                kwargs,
+            )
+        finally:
+            cell_call_state.finish()
 
+    async def acall_tool(
+        self,
+        tool_name: str,
+        args: Sequence[Any],
+        kwargs: Mapping[str, Any],
+    ) -> Observation:
+        conversation, cell_call_state = self._current_call_context()
+        try:
+            cell_call_state.begin(tool_name)
+        except (
+            _ToolCallBudgetExceededError,
+            _ToolCallAdmissionsClosedError,
+        ) as exc:
+            self._record_nested_exception(tool_name, exc)
+            raise
+
+        try:
+            concurrent_worker = self._tool_thread_pool.submit(
+                self._execute_tool_call,
+                conversation,
+                tool_name,
+                args,
+                kwargs,
+            )
+        except BaseException:
+            cell_call_state.finish()
+            raise
+
+        try:
+            # asyncio.wrap_future installs its thread-safe loop notification on
+            # the concurrent Future. Add the admission-release callback after it,
+            # so wait_until_idle cannot return before notification is enqueued.
+            worker = asyncio.wrap_future(concurrent_worker, loop=self._loop)
+        finally:
+            concurrent_worker.add_done_callback(
+                lambda _future: cell_call_state.finish()
+            )
+        worker.add_done_callback(self._consume_async_worker_exception)
+
+        # Cancellation of the asyncio wrapper must not cancel a queued or
+        # running environment mutation. The per-cell state keeps the admission
+        # live, and cell cleanup waits for the concurrent worker to finish.
+        return await asyncio.shield(worker)
+
+    def _execute_tool_call(
+        self,
+        conversation: LocalConversation,
+        tool_name: str,
+        args: Sequence[Any],
+        kwargs: Mapping[str, Any],
+    ) -> Observation:
+        if tool_name == self._tool_name:
+            raise ValueError("programmatic_tool_calling cannot call itself.")
+
+        try:
             tool = self._get_tool(conversation, tool_name)
             if tool.executor is None:
                 raise NotImplementedError(f"Tool '{tool_name}' has no executor")
@@ -363,28 +558,24 @@ class ProgrammaticToolCallingExecutor(
             self._record_nested_tool_error(tool_name, observation.text)
         return observation
 
-    async def acall_tool(
-        self,
-        tool_name: str,
-        args: Sequence[Any],
-        kwargs: Mapping[str, Any],
-    ) -> Observation:
-        return await asyncio.to_thread(
-            self.call_tool,
-            tool_name,
-            args,
-            kwargs,
-        )
-
-    def require_tool_available(self, tool_name: str) -> None:
-        conversation = self._conversation
-        if conversation is None:
-            raise RuntimeError("OpenHands tools can only be called during execution.")
+    @staticmethod
+    def _consume_async_worker_exception(worker: asyncio.Future) -> None:
+        if worker.cancelled():
+            return
         try:
-            self._get_tool(conversation, tool_name)
-        except Exception as exc:
-            self._record_nested_exception(tool_name, exc)
-            raise
+            worker.exception()
+        except BaseException:
+            # Retrieval prevents a detached, shielded worker from producing an
+            # "exception was never retrieved" warning after its wrapper is
+            # cancelled. The awaiting user task still receives the exception.
+            pass
+
+    def _current_call_context(self) -> tuple[LocalConversation, _CellCallState]:
+        conversation = self._conversation
+        cell_call_state = self._cell_call_state
+        if conversation is None or cell_call_state is None:
+            raise RuntimeError("OpenHands tools can only be called during execution.")
+        return conversation, cell_call_state
 
     def available_tool_names(self) -> list[str]:
         conversation = self._conversation
@@ -408,60 +599,40 @@ class ProgrammaticToolCallingExecutor(
         return shell
 
     def _run_cell(self, code: str) -> tuple[Any, int]:
-        preprocessing_exc_tuple = None
+        cell_call_state = self._cell_call_state
+        if cell_call_state is None:
+            raise RuntimeError("No per-cell tool-call state is installed.")
         try:
-            transformed_cell = self._shell.transform_cell(code)
-        except Exception:
-            transformed_cell = None
-            preprocessing_exc_tuple = sys.exc_info()
-        if self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
-            validate_orchestration_code(
-                transformed_cell if transformed_cell is not None else code,
-                self.available_tool_names(),
-            )
-        try:
+            preprocessing_exc_tuple = None
+            try:
+                transformed_cell = self._shell.transform_cell(code)
+            except Exception:
+                transformed_cell = None
+                preprocessing_exc_tuple = sys.exc_info()
+            if self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
+                validate_orchestration_code(
+                    transformed_cell if transformed_cell is not None else code,
+                    self.available_tool_names(),
+                )
             result = self._loop.run_until_complete(
-                self._run_cell_with_timeout(
+                self._shell.run_cell_async(
                     code,
-                    transformed_cell,
-                    preprocessing_exc_tuple,
+                    store_history=True,
+                    transformed_cell=transformed_cell,
+                    preprocessing_exc_tuple=preprocessing_exc_tuple,
                 )
             )
         finally:
-            # User code can schedule work without awaiting it. Do not let that work
-            # resume under a later action's conversation and execute tools there.
-            conversation = self._conversation
-            self._conversation = None
-            try:
-                orphaned_task_count = self._cancel_and_drain_pending_tasks()
-            finally:
-                self._conversation = conversation
+            # First reject any worker that has not yet entered a direct tool call,
+            # then cancel asyncio wrappers and retrieve their results. Cancelling
+            # the wrapper cannot stop its concurrent worker, so wait for every
+            # admitted call while the current conversation remains installed.
+            # Only then may the caller clear it or begin another cell.
+            cell_call_state.close_admissions()
+            orphaned_task_count = self._cancel_and_drain_pending_tasks()
+            cell_call_state.wait_until_idle()
+            self._flush_loop_callbacks()
         return result, orphaned_task_count
-
-    async def _run_cell_with_timeout(
-        self,
-        code: str,
-        transformed_cell: str | None,
-        preprocessing_exc_tuple: Any,
-    ) -> Any:
-        cell_task = asyncio.create_task(
-            self._shell.run_cell_async(
-                code,
-                store_history=True,
-                transformed_cell=transformed_cell,
-                preprocessing_exc_tuple=preprocessing_exc_tuple,
-            )
-        )
-        done, _ = await asyncio.wait(
-            (cell_task,),
-            timeout=self._execution_timeout_seconds,
-        )
-        if cell_task in done:
-            return cell_task.result()
-
-        cell_task.cancel()
-        await asyncio.gather(cell_task, return_exceptions=True)
-        raise _CellExecutionTimeoutError(self._execution_timeout_seconds)
 
     def _cancel_and_drain_pending_tasks(self) -> int:
         """Cancel tasks left on this executor's private loop and retrieve results."""
@@ -476,6 +647,43 @@ class ProgrammaticToolCallingExecutor(
                 asyncio.gather(*pending, return_exceptions=True)
             )
         return len(pending)
+
+    def _flush_loop_callbacks(self) -> None:
+        """Deliver worker completion and exception-retrieval callbacks."""
+        if self._loop.is_closed():
+            return
+        # Completing the wrapped Future schedules its done callbacks, so two
+        # zero-delay turns are intentional.
+        self._loop.run_until_complete(asyncio.sleep(0))
+        self._loop.run_until_complete(asyncio.sleep(0))
+
+    @staticmethod
+    def _log_cell_telemetry(
+        execution_count: int,
+        telemetry: _CellCallTelemetry,
+    ) -> None:
+        log = logger.warning if telemetry.limit_reached else logger.debug
+        log(
+            "Programmatic tool cell %d nested-call telemetry: "
+            "limit=%d attempts=%d admitted=%d completed=%d rejected=%d "
+            "limit_reached=%s",
+            execution_count,
+            telemetry.limit,
+            telemetry.attempts,
+            telemetry.admitted,
+            telemetry.completed,
+            telemetry.rejected,
+            telemetry.limit_reached,
+            extra={
+                "ptc_execution_count": execution_count,
+                "ptc_tool_call_limit": telemetry.limit,
+                "ptc_tool_call_attempts": telemetry.attempts,
+                "ptc_tool_calls_admitted": telemetry.admitted,
+                "ptc_tool_calls_completed": telemetry.completed,
+                "ptc_tool_calls_rejected": telemetry.rejected,
+                "ptc_tool_call_limit_reached": telemetry.limit_reached,
+            },
+        )
 
     def _consume_future_exceptions_from_traceback(
         self,
@@ -650,14 +858,28 @@ class ProgrammaticToolCallingExecutor(
     def _classify_error(self, error: BaseException | None) -> _ExecutionError:
         if error is None:
             return _ExecutionError()
-        if isinstance(error, _CellExecutionTimeoutError):
+        if isinstance(error, _ToolCallBudgetExceededError):
+            symbol = error.tool_name if isinstance(error.tool_name, str) else ""
+            routes = self._routing_index.for_symbol(symbol) if symbol else ()
             return _ExecutionError(
                 kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
                 guidance=(
-                    "Keep loops bounded with an explicit iteration limit or "
-                    "terminating condition, and await all asynchronous work "
-                    "before the cell ends."
+                    "Use bounded loops and stop retrying or paginating when the "
+                    "tool response indicates completion. Reuse prior results "
+                    "instead of repeatedly issuing the same call."
                 ),
+                suggested_routes=self._suggested_routes(routes),
+            )
+        if isinstance(error, _ToolCallAdmissionsClosedError):
+            symbol = error.tool_name if isinstance(error.tool_name, str) else ""
+            routes = self._routing_index.for_symbol(symbol) if symbol else ()
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
+                guidance=(
+                    "Await all scheduled tool calls in the current cell instead "
+                    "of leaving background work running."
+                ),
+                suggested_routes=self._suggested_routes(routes),
             )
         if isinstance(error, OrchestrationPolicyError):
             routes = self._routing_index.for_capabilities(error.capabilities)
@@ -735,7 +957,12 @@ class ProgrammaticToolCallingExecutor(
         error: BaseException,
         guidance: str | None,
     ) -> str:
-        if isinstance(error, OrchestrationPolicyError | _CellExecutionTimeoutError):
+        if isinstance(
+            error,
+            OrchestrationPolicyError
+            | _ToolCallBudgetExceededError
+            | _ToolCallAdmissionsClosedError,
+        ):
             output = str(error)
         else:
             output = "Traceback:\n" + "".join(traceback.format_exception(error))
@@ -750,7 +977,7 @@ class ProgrammaticToolCallingExecutor(
     def _record_nested_exception(
         self,
         tool_name: str,
-        error: Exception,
+        error: BaseException,
     ) -> None:
         execution_error = self._classify_error(error)
         text = f"{type(error).__name__}: {error}"

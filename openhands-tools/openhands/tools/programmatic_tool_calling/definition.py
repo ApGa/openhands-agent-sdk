@@ -62,7 +62,7 @@ local-access patterns; it is not a security sandbox. Local access remains
 unsupported even when a Python escape is not intercepted.
 """
 
-DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS = 300.0
+DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS = 1024
 
 
 class ProgrammaticToolCallingMode(StrEnum):
@@ -125,6 +125,30 @@ class ProgrammaticToolCallingObservation(Observation):
         default=(),
         description="Nested OpenHands tools that returned or raised errors.",
     )
+    tool_call_limit: int = Field(
+        default=DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS,
+        description="Configured direct nested-tool-call limit for this cell.",
+    )
+    tool_call_attempts: int = Field(
+        default=0,
+        description="Direct nested tool calls attempted by this cell.",
+    )
+    tool_calls_admitted: int = Field(
+        default=0,
+        description="Direct nested tool calls admitted for execution.",
+    )
+    tool_calls_completed: int = Field(
+        default=0,
+        description="Admitted direct nested tool calls that finished.",
+    )
+    tool_calls_rejected: int = Field(
+        default=0,
+        description="Direct nested tool calls rejected by the per-cell limit.",
+    )
+    tool_call_limit_reached: bool = Field(
+        default=False,
+        description="Whether this cell attempted a call beyond its limit.",
+    )
 
 
 class ProgrammaticToolCallingTool(
@@ -142,8 +166,8 @@ class ProgrammaticToolCallingTool(
         mode: ProgrammaticToolCallingMode | str = (
             ProgrammaticToolCallingMode.UNRESTRICTED
         ),
-        execution_timeout_seconds: float = (
-            DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+        max_tool_calls_per_execution: int = (
+            DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS
         ),
     ) -> Sequence["ProgrammaticToolCallingTool"]:
         _ = conv_state
@@ -155,18 +179,18 @@ class ProgrammaticToolCallingTool(
         executor = ProgrammaticToolCallingExecutor(
             tool_name=cls.name,
             mode=execution_mode,
-            execution_timeout_seconds=execution_timeout_seconds,
+            max_tool_calls_per_execution=max_tool_calls_per_execution,
         )
         description = TOOL_DESCRIPTION
         if execution_mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
             description += ORCHESTRATION_ONLY_DESCRIPTION
         description += (
-            "\nEach program must finish within "
-            f"{executor.execution_timeout_seconds:g} seconds. "
-            "Keep loops bounded with an explicit iteration limit or terminating "
-            "condition.\n"
+            "\nEach program may make at most "
+            f"{executor.max_tool_calls_per_execution} direct OpenHands tool "
+            "calls. A long-running tool call, including a delegated agent "
+            "subtree, counts once. Keep loops bounded with an explicit iteration "
+            "limit or terminating condition.\n"
         )
-
         return [
             cls(
                 description=description,

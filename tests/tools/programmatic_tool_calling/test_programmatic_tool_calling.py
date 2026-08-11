@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import threading
 import time
 from collections.abc import Sequence
@@ -22,7 +23,7 @@ from openhands.sdk.tool import (
     resolve_tool,
 )
 from openhands.tools.programmatic_tool_calling import (
-    DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS,
+    DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS,
     ProgrammaticToolCallingAction,
     ProgrammaticToolCallingErrorKind,
     ProgrammaticToolCallingExecutor,
@@ -421,50 +422,275 @@ def test_programmatic_tool_calling_runs_async_tools_concurrently(
     assert concurrent_sleep_executor.max_active == 2
 
 
-def test_programmatic_tool_calling_times_out_and_cancels_infinite_async_loop(
+@pytest.mark.parametrize("async_call", [False, True])
+def test_default_budget_does_not_time_out_long_nested_tool_call(
+    conversation,
+    concurrent_sleep_executor: SleepExecutor,
+    async_call: bool,
+) -> None:
+    executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        max_tool_calls_per_execution=1,
+    )
+    call = "await atools.concurrent_sleep" if async_call else "tools.concurrent_sleep"
+    try:
+        started = time.monotonic()
+        obs = run_code(
+            executor,
+            conversation,
+            (f"result = {call}(label='delegated-subtree', delay=0.15)\nresult.label"),
+        )
+
+        assert time.monotonic() - started >= 0.1
+        assert obs.is_error is False
+        assert "delegated-subtree" in obs.text
+        assert concurrent_sleep_executor.calls == ["delegated-subtree"]
+        assert obs.tool_call_limit == 1
+        assert obs.tool_call_attempts == 1
+        assert obs.tool_calls_admitted == 1
+        assert obs.tool_calls_completed == 1
+        assert obs.tool_calls_rejected == 0
+        assert obs.tool_call_limit_reached is False
+        assert "nested-call telemetry" not in obs.text
+        assert obs.model_dump()["tool_call_attempts"] == 1
+        llm_text = "".join(
+            getattr(content, "text", "") for content in obs.to_llm_content
+        )
+        assert llm_text == obs.text
+        assert "tool_call_attempts" not in llm_text
+    finally:
+        executor.close()
+
+
+def test_tool_call_budget_stops_sequential_runaway_and_resets_next_cell(
+    conversation,
+    echo_executor: EchoExecutor,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        max_tool_calls_per_execution=3,
+    )
+    try:
+        caplog.set_level(
+            logging.WARNING,
+            logger="openhands.tools.programmatic_tool_calling.impl",
+        )
+        obs = run_code(
+            executor,
+            conversation,
+            (
+                "while True:\n"
+                "    try:\n"
+                "        echo(text='retry')\n"
+                "    except Exception:\n"
+                "        pass"
+            ),
+        )
+
+        assert obs.is_error is True
+        assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+        assert "per-cell budget of 3 direct OpenHands tool-call attempts" in obs.text
+        assert "Use bounded loops" in obs.text
+        assert obs.failed_tool_names == ("echo",)
+        assert obs.tool_call_limit == 3
+        assert obs.tool_call_attempts == 4
+        assert obs.tool_calls_admitted == 3
+        assert obs.tool_calls_completed == 3
+        assert obs.tool_calls_rejected == 1
+        assert obs.tool_call_limit_reached is True
+        assert len(echo_executor.calls) == 3
+        cap_record = next(
+            record
+            for record in caplog.records
+            if getattr(record, "ptc_tool_call_limit_reached", False)
+        )
+        assert cap_record.ptc_tool_call_limit == 3
+        assert cap_record.ptc_tool_call_attempts == 4
+        assert cap_record.ptc_tool_calls_admitted == 3
+        assert cap_record.ptc_tool_calls_completed == 3
+        assert cap_record.ptc_tool_calls_rejected == 1
+
+        follow_up = run_code(executor, conversation, "echo(text='next-cell').text")
+        assert follow_up.is_error is False
+        assert "next-cell" in follow_up.text
+        assert follow_up.tool_call_attempts == 1
+        assert follow_up.tool_calls_admitted == 1
+        assert follow_up.tool_calls_completed == 1
+        assert follow_up.tool_calls_rejected == 0
+        assert follow_up.tool_call_limit_reached is False
+        assert len(echo_executor.calls) == 4
+    finally:
+        executor.close()
+
+
+def test_tool_call_budget_handles_malformed_tool_name_without_secondary_error(
+    conversation,
+) -> None:
+    executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        max_tool_calls_per_execution=1,
+    )
+    try:
+        obs = run_code(
+            executor,
+            conversation,
+            (
+                "while True:\n"
+                "    try:\n"
+                "        call_tool({'name': 'echo'})\n"
+                "    except Exception:\n"
+                "        pass"
+            ),
+        )
+
+        assert obs.is_error is True
+        assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+        assert "per-cell budget of 1 direct OpenHands tool-call attempt" in obs.text
+        assert "unhashable type" not in obs.text
+        assert obs.failed_tool_names == ("<invalid dict tool name>",)
+        assert obs.tool_call_attempts == 2
+        assert obs.tool_calls_admitted == 1
+        assert obs.tool_calls_completed == 1
+        assert obs.tool_calls_rejected == 1
+        assert obs.tool_call_limit_reached is True
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+def test_missing_tool_runaway_is_covered_by_tool_call_budget(
+    conversation,
+    async_call: bool,
+) -> None:
+    executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        max_tool_calls_per_execution=2,
+    )
+    call = 'await atools["missing_tool"]()' if async_call else 'tools["missing_tool"]()'
+    try:
+        obs = run_code(
+            executor,
+            conversation,
+            (
+                "while True:\n"
+                "    try:\n"
+                f"        {call}\n"
+                "    except Exception:\n"
+                "        pass"
+            ),
+        )
+
+        assert obs.is_error is True
+        assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
+        assert "ToolNotFoundError" in obs.text
+        assert "per-cell budget of 2 direct OpenHands tool-call attempts" in obs.text
+        assert obs.failed_tool_names == ("missing_tool",)
+        assert obs.tool_call_attempts == 3
+        assert obs.tool_calls_admitted == 2
+        assert obs.tool_calls_completed == 2
+        assert obs.tool_calls_rejected == 1
+        assert obs.tool_call_limit_reached is True
+    finally:
+        executor.close()
+
+
+def test_concurrent_tool_call_budget_drains_admitted_calls_before_return(
     conversation,
     concurrent_sleep_executor: SleepExecutor,
 ) -> None:
-    timeout_executor = ProgrammaticToolCallingExecutor(
+    executor = ProgrammaticToolCallingExecutor(
         tool_name=ProgrammaticToolCallingTool.name,
-        execution_timeout_seconds=0.05,
+        max_tool_calls_per_execution=2,
     )
     try:
         started = time.monotonic()
         obs = run_code(
-            timeout_executor,
+            executor,
             conversation,
             (
-                "try:\n"
-                '    tools["does_not_exist"]()\n'
-                "except LookupError:\n"
-                "    pass\n"
-                "while True:\n"
-                "    await atools.concurrent_sleep(label='loop', delay=0.01)"
+                "await asyncio.gather(*(\n"
+                "    atools.concurrent_sleep(label=f'call-{i}', delay=0.15)\n"
+                "    for i in range(3)\n"
+                "))"
             ),
         )
         elapsed = time.monotonic() - started
 
         assert obs.is_error is True
         assert obs.error_kind is ProgrammaticToolCallingErrorKind.PYTHON_ERROR
-        assert (
-            "Programmatic tool execution exceeded its 0.05-second time limit"
-            in obs.text
-        )
-        assert "Keep loops bounded" in obs.text
-        assert obs.failed_tool_names == ("does_not_exist",)
-        assert elapsed < 5
+        assert "per-cell budget of 2 direct OpenHands tool-call attempts" in obs.text
+        assert obs.failed_tool_names == ("concurrent_sleep",)
+        assert obs.tool_call_limit == 2
+        assert obs.tool_call_attempts == 3
+        assert obs.tool_calls_admitted == 2
+        assert obs.tool_calls_completed == 2
+        assert obs.tool_calls_rejected == 1
+        assert obs.tool_call_limit_reached is True
+        assert elapsed >= 0.1
+        assert concurrent_sleep_executor.active == 0
+        assert len(concurrent_sleep_executor.calls) == 2
 
-        calls_at_timeout = len(concurrent_sleep_executor.calls)
+        calls_at_return = list(concurrent_sleep_executor.calls)
         time.sleep(0.1)
-        assert len(concurrent_sleep_executor.calls) == calls_at_timeout
+        assert concurrent_sleep_executor.calls == calls_at_return
 
-        follow_up = run_code(timeout_executor, conversation, '"after-timeout"')
+        follow_up = run_code(executor, conversation, '"clean-next-cell"')
         assert follow_up.is_error is False
-        assert "after-timeout" in follow_up.text
-        assert len(concurrent_sleep_executor.calls) == calls_at_timeout
+        assert "clean-next-cell" in follow_up.text
+        assert follow_up.tool_call_attempts == 0
+        assert follow_up.tool_calls_admitted == 0
+        assert follow_up.tool_calls_completed == 0
+        assert follow_up.tool_calls_rejected == 0
+        assert follow_up.tool_call_limit_reached is False
     finally:
-        timeout_executor.close()
+        executor.close()
+
+
+def test_cancelled_async_wrapper_drains_admitted_worker_before_cell_returns(
+    conversation,
+    concurrent_sleep_executor: SleepExecutor,
+) -> None:
+    executor = ProgrammaticToolCallingExecutor(
+        tool_name=ProgrammaticToolCallingTool.name,
+        max_tool_calls_per_execution=1,
+    )
+    try:
+        started = time.monotonic()
+        obs = run_code(
+            executor,
+            conversation,
+            (
+                "async def run_tool():\n"
+                "    return await atools.concurrent_sleep(\n"
+                "        label='cancelled-wrapper', delay=0.15\n"
+                "    )\n"
+                "task = asyncio.create_task(run_tool())\n"
+                "await asyncio.sleep(0.02)\n"
+                "task.cancel()\n"
+                "try:\n"
+                "    await task\n"
+                "except asyncio.CancelledError:\n"
+                "    pass\n"
+                '"wrapper-cancelled"'
+            ),
+        )
+
+        assert time.monotonic() - started >= 0.1
+        assert obs.is_error is False
+        assert "wrapper-cancelled" in obs.text
+        assert concurrent_sleep_executor.active == 0
+        assert concurrent_sleep_executor.calls == ["cancelled-wrapper"]
+        assert obs.tool_call_attempts == 1
+        assert obs.tool_calls_admitted == 1
+        assert obs.tool_calls_completed == 1
+        assert obs.tool_calls_rejected == 0
+
+        calls_at_return = list(concurrent_sleep_executor.calls)
+        time.sleep(0.1)
+        assert concurrent_sleep_executor.calls == calls_at_return
+    finally:
+        executor.close()
 
 
 def test_programmatic_tool_calling_cancels_tasks_abandoned_by_asyncio_run(
@@ -875,7 +1101,7 @@ def test_tool_factory_configures_orchestration_only_mode() -> None:
             name=ProgrammaticToolCallingTool.name,
             params={
                 "mode": "orchestration_only",
-                "execution_timeout_seconds": 12.5,
+                "max_tool_calls_per_execution": 17,
             },
         ),
         cast("ConversationState", SimpleNamespace()),
@@ -883,34 +1109,35 @@ def test_tool_factory_configures_orchestration_only_mode() -> None:
 
     assert isinstance(tool.executor, ProgrammaticToolCallingExecutor)
     assert tool.executor.mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY
-    assert tool.executor.execution_timeout_seconds == 12.5
+    assert tool.executor.max_tool_calls_per_execution == 17
     assert "outside the task environment" in tool.description
-    assert "finish within 12.5 seconds" in tool.description
+    assert "at most 17 direct OpenHands tool calls" in tool.description
 
 
-def test_programmatic_tool_calling_default_timeout(
+def test_programmatic_tool_calling_default_tool_call_budget(
     executor: ProgrammaticToolCallingExecutor,
 ) -> None:
     assert (
-        executor.execution_timeout_seconds
-        == DEFAULT_PROGRAMMATIC_TOOL_CALLING_TIMEOUT_SECONDS
+        executor.max_tool_calls_per_execution
+        == DEFAULT_PROGRAMMATIC_TOOL_CALLING_MAX_TOOL_CALLS
+        == 1024
     )
 
 
 @pytest.mark.parametrize(
-    "execution_timeout_seconds",
-    [0, -1, float("inf"), float("nan"), True, "5"],
+    "max_tool_calls_per_execution",
+    [0, -1, 1.5, True, "5", None],
 )
-def test_programmatic_tool_calling_rejects_invalid_timeout(
-    execution_timeout_seconds,
+def test_programmatic_tool_calling_rejects_invalid_tool_call_budget(
+    max_tool_calls_per_execution,
 ) -> None:
     with pytest.raises(
         ValueError,
-        match="execution_timeout_seconds must be a positive number",
+        match="max_tool_calls_per_execution must be a positive integer",
     ):
         ProgrammaticToolCallingExecutor(
             tool_name=ProgrammaticToolCallingTool.name,
-            execution_timeout_seconds=execution_timeout_seconds,
+            max_tool_calls_per_execution=max_tool_calls_per_execution,
         )
 
 
