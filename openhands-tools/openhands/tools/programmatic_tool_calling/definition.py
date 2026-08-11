@@ -1,6 +1,7 @@
 """Programmatic tool calling through a persistent embedded IPython shell."""
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from pydantic import Field
@@ -50,6 +51,31 @@ results = await asyncio.gather(
 The programmatic tool cannot call itself recursively.
 """
 
+ORCHESTRATION_ONLY_DESCRIPTION = """
+
+This Python runtime is outside the task environment and is available only for
+orchestrating OpenHands tools. Do not use local filesystem, operating-system,
+process, shell, or network APIs here. Use the tools exposed through `atools` for
+those operations. Policy errors include a route based on metadata declared by the
+currently available tools when possible. This behavioral guard catches common
+local-access patterns; it is not a security sandbox. Local access remains
+unsupported even when a Python escape is not intercepted.
+"""
+
+
+class ProgrammaticToolCallingMode(StrEnum):
+    UNRESTRICTED = "unrestricted"
+    ORCHESTRATION_ONLY = "orchestration_only"
+
+
+class ProgrammaticToolCallingErrorKind(StrEnum):
+    POLICY_VIOLATION = "orchestration_policy_violation"
+    NAME_ERROR = "name_error"
+    MODULE_NOT_FOUND = "module_not_found"
+    TOOL_NOT_FOUND = "tool_not_found"
+    TOOL_ERROR = "tool_error"
+    PYTHON_ERROR = "python_error"
+
 
 class ProgrammaticToolCallingAction(Action):
     """Schema for executing Python code in the programmatic tool environment."""
@@ -77,6 +103,26 @@ class ProgrammaticToolCallingObservation(Observation):
     execution_count: int = Field(
         description="Number of Python executions run by this tool instance."
     )
+    error_kind: ProgrammaticToolCallingErrorKind | None = Field(
+        default=None,
+        description="Machine-readable category for an execution error.",
+    )
+    policy_violation: bool = Field(
+        default=False,
+        description="Whether orchestration-only policy rejected the operation.",
+    )
+    missing_symbol: str | None = Field(
+        default=None,
+        description="Missing Python symbol, module, or OpenHands tool name.",
+    )
+    suggested_routes: tuple[str, ...] = Field(
+        default=(),
+        description="Task-environment tool invocations suggested to the agent.",
+    )
+    failed_tool_names: tuple[str, ...] = Field(
+        default=(),
+        description="Nested OpenHands tools that returned or raised errors.",
+    )
 
 
 class ProgrammaticToolCallingTool(
@@ -91,15 +137,23 @@ class ProgrammaticToolCallingTool(
     def create(
         cls,
         conv_state: "ConversationState",
+        mode: ProgrammaticToolCallingMode | str = (
+            ProgrammaticToolCallingMode.UNRESTRICTED
+        ),
     ) -> Sequence["ProgrammaticToolCallingTool"]:
         _ = conv_state
         from openhands.tools.programmatic_tool_calling.impl import (
             ProgrammaticToolCallingExecutor,
         )
 
+        execution_mode = ProgrammaticToolCallingMode(mode)
+        description = TOOL_DESCRIPTION
+        if execution_mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
+            description += ORCHESTRATION_ONLY_DESCRIPTION
+
         return [
             cls(
-                description=TOOL_DESCRIPTION,
+                description=description,
                 action_type=ProgrammaticToolCallingAction,
                 observation_type=ProgrammaticToolCallingObservation,
                 annotations=ToolAnnotations(
@@ -109,7 +163,10 @@ class ProgrammaticToolCallingTool(
                     idempotentHint=False,
                     openWorldHint=True,
                 ),
-                executor=ProgrammaticToolCallingExecutor(tool_name=cls.name),
+                executor=ProgrammaticToolCallingExecutor(
+                    tool_name=cls.name,
+                    mode=execution_mode,
+                ),
             )
         ]
 

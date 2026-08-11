@@ -9,6 +9,7 @@ import threading
 import traceback
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from IPython.terminal.embed import InteractiveShellEmbed
@@ -19,7 +20,19 @@ from openhands.sdk.tool import Observation, ToolExecutor
 from openhands.sdk.utils import maybe_truncate
 from openhands.tools.programmatic_tool_calling.definition import (
     ProgrammaticToolCallingAction,
+    ProgrammaticToolCallingErrorKind,
+    ProgrammaticToolCallingMode,
     ProgrammaticToolCallingObservation,
+)
+from openhands.tools.programmatic_tool_calling.policy import (
+    OrchestrationPolicyError,
+    capabilities_for_missing_symbol,
+    orchestration_only_bindings,
+    validate_orchestration_code,
+)
+from openhands.tools.programmatic_tool_calling.routing import (
+    ToolRoute,
+    ToolRoutingIndex,
 )
 
 
@@ -39,6 +52,30 @@ _RESERVED_NAMES = frozenset(
         "tools",
     }
 )
+
+
+class ToolNotFoundError(LookupError):
+    def __init__(self, tool_name: str, available_tool_names: Sequence[str]):
+        self.tool_name = tool_name
+        super().__init__(
+            f"Tool '{tool_name}' not found. Available tools: "
+            f"{list(available_tool_names)}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _NestedToolError:
+    tool_name: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionError:
+    kind: ProgrammaticToolCallingErrorKind | None = None
+    policy_violation: bool = False
+    missing_symbol: str | None = None
+    guidance: str | None = None
+    suggested_routes: tuple[str, ...] = ()
 
 
 class _ToolFunction:
@@ -135,13 +172,23 @@ class ProgrammaticToolCallingExecutor(
 ):
     """Execute Python code in a persistent IPython namespace with tool callables."""
 
-    def __init__(self, tool_name: str):
+    def __init__(
+        self,
+        tool_name: str,
+        mode: ProgrammaticToolCallingMode | str = (
+            ProgrammaticToolCallingMode.UNRESTRICTED
+        ),
+    ):
         self._tool_name = tool_name
+        self._mode = ProgrammaticToolCallingMode(mode)
         self._shell = self._create_shell()
         self._loop = asyncio.new_event_loop()
         self._lock = threading.RLock()
+        self._nested_error_lock = threading.Lock()
         self._resource_lock_manager = ResourceLockManager()
         self._conversation: LocalConversation | None = None
+        self._routing_index = ToolRoutingIndex(routes=(), available_tool_names=())
+        self._nested_tool_errors: list[_NestedToolError] = []
         self._execution_count = 0
 
     def __call__(
@@ -154,6 +201,7 @@ class ProgrammaticToolCallingExecutor(
                 "programmatic_tool_calling requires a LocalConversation context.",
                 is_error=True,
                 execution_count=self._execution_count,
+                error_kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
             )
 
         code = action.code.strip()
@@ -162,38 +210,72 @@ class ProgrammaticToolCallingExecutor(
                 "No Python code was provided.",
                 is_error=True,
                 execution_count=self._execution_count,
+                error_kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR,
             )
 
         with self._lock:
             self._conversation = conversation
             self._install_tool_namespace(conversation)
+            with self._nested_error_lock:
+                self._nested_tool_errors.clear()
             self._execution_count += 1
 
             stdout = io.StringIO()
             stderr = io.StringIO()
+            execution_error = _ExecutionError()
             try:
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     result = self._run_cell(code)
 
+                python_error = getattr(result, "error_before_exec", None) or getattr(
+                    result, "error_in_exec", None
+                )
+                execution_error = self._classify_error(python_error)
+                nested_tool_errors = self._nested_errors_snapshot()
                 output = self._format_output(
                     stdout=stdout.getvalue(),
                     stderr=stderr.getvalue(),
                     result=getattr(result, "result", None),
-                    error=getattr(result, "error_before_exec", None)
-                    or getattr(result, "error_in_exec", None),
+                    error=python_error,
+                    guidance=execution_error.guidance,
+                    nested_tool_errors=nested_tool_errors,
                 )
-                is_error = not getattr(result, "success", False)
+                is_error = not getattr(result, "success", False) or bool(
+                    nested_tool_errors
+                )
+                if nested_tool_errors and execution_error.kind is None:
+                    execution_error = _ExecutionError(
+                        kind=ProgrammaticToolCallingErrorKind.TOOL_ERROR
+                    )
             except BaseException as exc:
-                output = "Traceback:\n" + "".join(traceback.format_exception(exc))
+                execution_error = self._classify_error(exc)
+                output = self._format_caught_exception(exc, execution_error.guidance)
+                nested_tool_errors = self._nested_errors_snapshot()
                 is_error = True
             finally:
                 self._conversation = None
+                self._routing_index = ToolRoutingIndex(
+                    routes=(), available_tool_names=()
+                )
+
+        failed_tool_names = tuple(
+            dict.fromkeys(error.tool_name for error in nested_tool_errors)
+        )
 
         return ProgrammaticToolCallingObservation.from_text(
             maybe_truncate(output, truncate_after=MAX_PROGRAMMATIC_TOOL_OUTPUT_SIZE),
             is_error=is_error,
             execution_count=self._execution_count,
+            error_kind=execution_error.kind,
+            policy_violation=execution_error.policy_violation,
+            missing_symbol=execution_error.missing_symbol,
+            suggested_routes=execution_error.suggested_routes,
+            failed_tool_names=failed_tool_names,
         )
+
+    @property
+    def mode(self) -> ProgrammaticToolCallingMode:
+        return self._mode
 
     def close(self) -> None:
         with self._lock:
@@ -210,19 +292,26 @@ class ProgrammaticToolCallingExecutor(
         conversation = self._conversation
         if conversation is None:
             raise RuntimeError("OpenHands tools can only be called during execution.")
-        if tool_name == self._tool_name:
-            raise ValueError("programmatic_tool_calling cannot call itself.")
+        try:
+            if tool_name == self._tool_name:
+                raise ValueError("programmatic_tool_calling cannot call itself.")
 
-        tool = self._get_tool(conversation, tool_name)
-        if tool.executor is None:
-            raise NotImplementedError(f"Tool '{tool_name}' has no executor")
+            tool = self._get_tool(conversation, tool_name)
+            if tool.executor is None:
+                raise NotImplementedError(f"Tool '{tool_name}' has no executor")
 
-        arguments = self._normalize_tool_arguments(args, kwargs)
-        action = tool.action_from_arguments(arguments)
-        lock_keys = self._resolve_lock_keys(tool, action)
+            arguments = self._normalize_tool_arguments(args, kwargs)
+            action = tool.action_from_arguments(arguments)
+            lock_keys = self._resolve_lock_keys(tool, action)
 
-        with self._lock_tool_resources(lock_keys):
-            return tool(action, conversation)
+            with self._lock_tool_resources(lock_keys):
+                observation = tool(action, conversation)
+        except Exception as exc:
+            self._record_nested_exception(tool_name, exc)
+            raise
+        if observation.is_error:
+            self._record_nested_tool_error(tool_name, observation.text)
+        return observation
 
     async def acall_tool(
         self,
@@ -241,7 +330,11 @@ class ProgrammaticToolCallingExecutor(
         conversation = self._conversation
         if conversation is None:
             raise RuntimeError("OpenHands tools can only be called during execution.")
-        self._get_tool(conversation, tool_name)
+        try:
+            self._get_tool(conversation, tool_name)
+        except Exception as exc:
+            self._record_nested_exception(tool_name, exc)
+            raise
 
     def available_tool_names(self) -> list[str]:
         conversation = self._conversation
@@ -271,6 +364,11 @@ class ProgrammaticToolCallingExecutor(
         except Exception:
             transformed_cell = None
             preprocessing_exc_tuple = sys.exc_info()
+        if self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
+            validate_orchestration_code(
+                transformed_cell if transformed_cell is not None else code,
+                self.available_tool_names(),
+            )
         return self._loop.run_until_complete(
             self._shell.run_cell_async(
                 code,
@@ -282,11 +380,17 @@ class ProgrammaticToolCallingExecutor(
 
     def _install_tool_namespace(self, conversation: LocalConversation) -> None:
         shell_ns = self._shell.user_ns
+        self._routing_index = ToolRoutingIndex.from_tools(
+            conversation.agent.tools_map,
+            excluded_tool_name=self._tool_name,
+        )
         shell_ns["tools"] = _ToolNamespace(self)
         shell_ns["atools"] = _AsyncToolNamespace(self)
         shell_ns["call_tool"] = self._call_tool_by_name
         shell_ns["acall_tool"] = self._acall_tool_by_name
         shell_ns.setdefault("asyncio", asyncio)
+        if self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
+            shell_ns.update(orchestration_only_bindings())
 
         for tool_name in conversation.agent.tools_map:
             if tool_name == self._tool_name:
@@ -318,10 +422,7 @@ class ProgrammaticToolCallingExecutor(
 
         tool = conversation.agent.tools_map.get(tool_name)
         if tool is None:
-            available = self.available_tool_names()
-            raise KeyError(
-                f"Tool '{tool_name}' not found. Available tools: {available}"
-            )
+            raise ToolNotFoundError(tool_name, self.available_tool_names())
         return tool
 
     @staticmethod
@@ -352,6 +453,8 @@ class ProgrammaticToolCallingExecutor(
         stderr: str,
         result: Any,
         error: BaseException | None,
+        guidance: str | None,
+        nested_tool_errors: Sequence[_NestedToolError],
     ) -> str:
         parts: list[str] = []
 
@@ -369,9 +472,127 @@ class ProgrammaticToolCallingExecutor(
         if error is not None and not clean_stderr:
             parts.append("Traceback:\n" + "".join(traceback.format_exception(error)))
 
+        if nested_tool_errors:
+            nested = []
+            for tool_error in nested_tool_errors:
+                text = tool_error.text.strip() or "The tool returned an empty error."
+                nested.append(f"{tool_error.tool_name}: {text}")
+            parts.append("Nested tool call errors:\n" + "\n".join(nested))
+
+        if guidance is not None:
+            parts.append("Corrective guidance:\n" + guidance)
+
         if not parts:
             return "Executed successfully with no output."
         return "\n\n".join(parts)
+
+    def _classify_error(self, error: BaseException | None) -> _ExecutionError:
+        if error is None:
+            return _ExecutionError()
+        if isinstance(error, OrchestrationPolicyError):
+            routes = self._routing_index.for_capabilities(error.capabilities)
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.POLICY_VIOLATION,
+                policy_violation=True,
+                guidance=self._routing_index.guidance_for_capabilities(
+                    error.capabilities
+                ),
+                suggested_routes=self._suggested_routes(routes),
+            )
+        if isinstance(error, ToolNotFoundError):
+            routes = self._routing_index.for_symbol(error.tool_name)
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.TOOL_NOT_FOUND,
+                missing_symbol=error.tool_name,
+                guidance=self._routing_index.guidance_for_symbol(error.tool_name),
+                suggested_routes=self._suggested_routes(routes),
+            )
+        if isinstance(error, ModuleNotFoundError):
+            missing_symbol = error.name
+            routes = self._routing_index.for_symbol(missing_symbol or "")
+            if (
+                not routes
+                and self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY
+            ):
+                routes = self._routing_index.for_capabilities(("python.execute",))
+            guidance = self._guidance_for_routes(routes)
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.MODULE_NOT_FOUND,
+                missing_symbol=missing_symbol,
+                guidance=guidance,
+                suggested_routes=self._suggested_routes(routes),
+            )
+        if isinstance(error, NameError):
+            missing_symbol = error.name
+            capabilities = capabilities_for_missing_symbol(missing_symbol or "")
+            if (
+                capabilities
+                and self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY
+            ):
+                routes = self._routing_index.for_capabilities(capabilities)
+                return _ExecutionError(
+                    kind=ProgrammaticToolCallingErrorKind.POLICY_VIOLATION,
+                    policy_violation=True,
+                    missing_symbol=missing_symbol,
+                    guidance=self._routing_index.guidance_for_capabilities(
+                        capabilities
+                    ),
+                    suggested_routes=self._suggested_routes(routes),
+                )
+            routes = self._routing_index.for_symbol(missing_symbol or "")
+            return _ExecutionError(
+                kind=ProgrammaticToolCallingErrorKind.NAME_ERROR,
+                missing_symbol=missing_symbol,
+                guidance=self._guidance_for_routes(routes),
+                suggested_routes=self._suggested_routes(routes),
+            )
+        return _ExecutionError(kind=ProgrammaticToolCallingErrorKind.PYTHON_ERROR)
+
+    def _guidance_for_routes(self, routes: Sequence[ToolRoute]) -> str | None:
+        if not routes:
+            if self._mode is ProgrammaticToolCallingMode.ORCHESTRATION_ONLY:
+                return self._routing_index.general_guidance()
+            return None
+        target = routes[0].target_name or routes[0].tool_name
+        return self._routing_index.guidance_for_symbol(target)
+
+    @staticmethod
+    def _suggested_routes(routes: Sequence[ToolRoute]) -> tuple[str, ...]:
+        return tuple(route.render() for route in routes[:3])
+
+    def _format_caught_exception(
+        self,
+        error: BaseException,
+        guidance: str | None,
+    ) -> str:
+        if isinstance(error, OrchestrationPolicyError):
+            output = str(error)
+        else:
+            output = "Traceback:\n" + "".join(traceback.format_exception(error))
+        if guidance is not None:
+            output += "\n\nCorrective guidance:\n" + guidance
+        return output
+
+    def _nested_errors_snapshot(self) -> tuple[_NestedToolError, ...]:
+        with self._nested_error_lock:
+            return tuple(self._nested_tool_errors)
+
+    def _record_nested_exception(
+        self,
+        tool_name: str,
+        error: Exception,
+    ) -> None:
+        execution_error = self._classify_error(error)
+        text = f"{type(error).__name__}: {error}"
+        if execution_error.guidance is not None:
+            text += "\nCorrective guidance:\n" + execution_error.guidance
+        self._record_nested_tool_error(tool_name, text)
+
+    def _record_nested_tool_error(self, tool_name: str, text: str) -> None:
+        with self._nested_error_lock:
+            self._nested_tool_errors.append(
+                _NestedToolError(tool_name=tool_name, text=text)
+            )
 
     @staticmethod
     def _strip_ansi(text: str) -> str:
