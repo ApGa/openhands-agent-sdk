@@ -25,20 +25,20 @@ def test_custom_action_observation_threshold():
     conv.send_message("start")
 
     # Create identical action-observation pairs
-    def create_action_obs():
+    def create_action_obs(i: int):
         action = ActionEvent(
             source="agent",
             thought=[TextContent(text="I need to run ls command")],
             action=TerminalAction(command="ls"),
             tool_name="execute_bash",
-            tool_call_id="call_1",
+            tool_call_id=f"call_{i}",
             tool_call=MessageToolCall(
-                id="call_1",
+                id=f"call_{i}",
                 name="execute_bash",
                 arguments='{"command": "ls"}',
                 origin="completion",
             ),
-            llm_response_id="response_1",
+            llm_response_id=f"response_{i}",
         )
         observation = ObservationEvent(
             source="environment",
@@ -47,13 +47,13 @@ def test_custom_action_observation_threshold():
             ),
             action_id=action.id,
             tool_name="execute_bash",
-            tool_call_id="call_1",
+            tool_call_id=f"call_{i}",
         )
         return action, observation
 
     # Add 4 pairs (would trigger default threshold of 4)
-    for _ in range(4):
-        action, observation = create_action_obs()
+    for i in range(4):
+        action, observation = create_action_obs(i)
         conv._state.events.append(action)
         conv._state.events.append(observation)
 
@@ -62,8 +62,8 @@ def test_custom_action_observation_threshold():
     assert not conv._stuck_detector.is_stuck()
 
     # Add 2 more pairs to reach threshold of 6
-    for _ in range(2):
-        action, observation = create_action_obs()
+    for i in range(4, 6):
+        action, observation = create_action_obs(i)
         conv._state.events.append(action)
         conv._state.events.append(observation)
 

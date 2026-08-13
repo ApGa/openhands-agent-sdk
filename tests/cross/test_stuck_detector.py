@@ -428,6 +428,172 @@ def test_repeating_action_error_stuck():
     assert stuck_detector.is_stuck() is True
 
 
+def _invalid_tool_action(
+    *, response_id: str, call_id: str, arguments: str, thought: str = ""
+) -> ActionEvent:
+    """Build the event emitted when a model names an unavailable tool."""
+    return ActionEvent(
+        source="agent",
+        thought=[TextContent(text=thought)] if thought else [],
+        action=None,
+        tool_name="filesystem",
+        tool_call_id=call_id,
+        tool_call=MessageToolCall(
+            id=call_id,
+            name="filesystem",
+            arguments=arguments,
+            origin="completion",
+        ),
+        llm_response_id=response_id,
+    )
+
+
+def _invalid_tool_error(action: ActionEvent) -> AgentErrorEvent:
+    return AgentErrorEvent(
+        source="agent",
+        error="Tool 'filesystem' not found",
+        tool_call_id=action.tool_call_id,
+        tool_name=action.tool_name,
+    )
+
+
+def test_parallel_sibling_errors_are_not_counted_as_loop_iterations():
+    """One parallel response is one iteration, even if every sibling fails."""
+    llm = LLM(model="gpt-4o-mini", usage_id="test-llm")
+    agent = Agent(llm=llm)
+    state = ConversationState.create(
+        id=uuid.uuid4(), agent=agent, workspace=LocalWorkspace(working_dir="/tmp")
+    )
+    stuck_detector = StuckDetector(state)
+
+    state.events.append(
+        MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user", content=[TextContent(text="Read these four files")]
+            ),
+        )
+    )
+
+    # This is the emission shape of one LLM response with parallel tool calls:
+    # all ActionEvents share llm_response_id, followed by their observations.
+    actions = [
+        _invalid_tool_action(
+            response_id="response_parallel",
+            call_id=f"call_{i}",
+            arguments=f'{{"path": "/tmp/file_{i}.txt"}}',
+            thought="Read the files" if i == 0 else "",
+        )
+        for i in range(4)
+    ]
+    for action in actions:
+        state.events.append(action)
+    for action in actions:
+        state.events.append(_invalid_tool_error(action))
+
+    assert stuck_detector.is_stuck() is False
+
+
+def test_invalid_tool_calls_with_different_arguments_are_not_equal():
+    """Raw arguments distinguish non-executable actions across model turns."""
+    llm = LLM(model="gpt-4o-mini", usage_id="test-llm")
+    agent = Agent(llm=llm)
+    state = ConversationState.create(
+        id=uuid.uuid4(), agent=agent, workspace=LocalWorkspace(working_dir="/tmp")
+    )
+    stuck_detector = StuckDetector(state)
+
+    for i in range(3):
+        action = _invalid_tool_action(
+            response_id=f"response_{i}",
+            call_id=f"call_{i}",
+            arguments=f'{{"path": "/tmp/file_{i}.txt"}}',
+            thought="Read a file",
+        )
+        state.events.append(action)
+        state.events.append(_invalid_tool_error(action))
+
+    assert stuck_detector.is_stuck() is False
+
+
+def test_repeated_parallel_invalid_batches_are_stuck_after_three_turns():
+    """Genuinely repeated parallel error batches still trigger detection."""
+    llm = LLM(model="gpt-4o-mini", usage_id="test-llm")
+    agent = Agent(llm=llm)
+    state = ConversationState.create(
+        id=uuid.uuid4(), agent=agent, workspace=LocalWorkspace(working_dir="/tmp")
+    )
+    stuck_detector = StuckDetector(state)
+
+    for turn in range(3):
+        actions = [
+            _invalid_tool_action(
+                response_id=f"response_{turn}",
+                call_id=f"call_{turn}_{i}",
+                arguments=f'{{"path": "/tmp/file_{i}.txt"}}',
+                thought="Read the files" if i == 0 else "",
+            )
+            for i in range(2)
+        ]
+        for action in actions:
+            state.events.append(action)
+        for action in actions:
+            state.events.append(_invalid_tool_error(action))
+
+    assert stuck_detector.is_stuck() is True
+
+
+def test_repeated_parallel_batches_pair_observations_in_action_order():
+    """Sibling completion order does not hide a genuine repeated loop."""
+    llm = LLM(model="gpt-4o-mini", usage_id="test-llm")
+    agent = Agent(llm=llm)
+    state = ConversationState.create(
+        id=uuid.uuid4(), agent=agent, workspace=LocalWorkspace(working_dir="/tmp")
+    )
+    stuck_detector = StuckDetector(state)
+
+    for turn in range(4):
+        actions = [
+            ActionEvent(
+                source="agent",
+                thought=[TextContent(text="Inspect files")] if i == 0 else [],
+                action=TerminalAction(command=f"cat /tmp/file_{i}.txt"),
+                tool_name="terminal",
+                tool_call_id=f"call_{turn}_{i}",
+                tool_call=MessageToolCall(
+                    id=f"call_{turn}_{i}",
+                    name="terminal",
+                    arguments=f'{{"command": "cat /tmp/file_{i}.txt"}}',
+                    origin="completion",
+                ),
+                llm_response_id=f"response_{turn}",
+            )
+            for i in range(2)
+        ]
+        observations = [
+            ObservationEvent(
+                source="environment",
+                observation=TerminalObservation.from_text(
+                    text=f"contents-{i}",
+                    command=f"cat /tmp/file_{i}.txt",
+                    exit_code=0,
+                ),
+                action_id=action.id,
+                tool_name=action.tool_name,
+                tool_call_id=action.tool_call_id,
+            )
+            for i, action in enumerate(actions)
+        ]
+        for action in actions:
+            state.events.append(action)
+        # Model action order stays A,B, but simulate executor completion order
+        # switching between A,B and B,A on successive turns.
+        for observation in observations[:: 1 if turn % 2 == 0 else -1]:
+            state.events.append(observation)
+
+    assert stuck_detector.is_stuck() is True
+
+
 def test_agent_monologue_stuck():
     """Test detection of agent monologue (repeated messages without user input)."""
     llm = LLM(model="gpt-4o-mini", usage_id="test-llm")

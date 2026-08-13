@@ -21,6 +21,13 @@ logger = get_logger(__name__)
 MAX_EVENTS_TO_SCAN_FOR_STUCK_DETECTION: int = 20
 
 
+# One model response can contain several parallel tool calls.  Those calls are one
+# agent iteration, not several iterations of a loop.  Keep them together while
+# looking for repetition so a batch of sibling failures cannot by itself trip the
+# stuck detector.
+ResponseBatch = tuple[list[ActionEvent], list[ObservationBaseEvent]]
+
+
 class StuckDetector:
     """Detects when an agent is stuck in repetitive or unproductive patterns.
 
@@ -95,30 +102,15 @@ class StuckDetector:
             f"Events after last user message: {[type(e).__name__ for e in events]}"
         )
 
-        # Collect enough actions and observations for detection
-        max_needed = max(self.action_observation_threshold, self.action_error_threshold)
-        last_actions: list[Event] = []
-        last_observations: list[Event] = []
-
-        # Retrieve the last N actions and observations from the end of history
-        for event in reversed(events):
-            if isinstance(event, ActionEvent) and len(last_actions) < max_needed:
-                last_actions.append(event)
-            elif (
-                isinstance(event, ObservationBaseEvent)
-                and len(last_observations) < max_needed
-            ):
-                last_observations.append(event)
-            if len(last_actions) >= max_needed and len(last_observations) >= max_needed:
-                break
+        response_batches = self._get_complete_response_batches(events)
 
         # Check all stuck patterns
         # scenario 1: same action, same observation
-        if self._is_stuck_repeating_action_observation(last_actions, last_observations):
+        if self._is_stuck_repeating_action_observation(response_batches):
             return True
 
         # scenario 2: same action, errors
-        if self._is_stuck_repeating_action_error(last_actions, last_observations):
+        if self._is_stuck_repeating_action_error(response_batches):
             return True
 
         # scenario 3: monologue
@@ -127,7 +119,7 @@ class StuckDetector:
 
         # scenario 4: action, observation alternating pattern
         if len(events) >= self.alternating_pattern_threshold:
-            if self._is_stuck_alternating_action_observation(events):
+            if self._is_stuck_alternating_action_observation(response_batches):
                 return True
 
         # scenario 5: context window error loop
@@ -137,25 +129,73 @@ class StuckDetector:
 
         return False
 
+    def _get_complete_response_batches(
+        self, events: list[Event]
+    ) -> list[ResponseBatch]:
+        """Group actions and their observations by originating LLM response.
+
+        OpenHands emits one :class:`ActionEvent` per tool call, even when several
+        calls came from the same model response.  Treating those siblings as
+        separate loop iterations causes false-positive stuck detection (especially
+        when a parallel batch contains several invalid calls).  A batch is included
+        only when every action visible in the scan window has a corresponding
+        observation; partial batches at the edge of the bounded history are ignored.
+        """
+        actions_by_response: dict[str, list[ActionEvent]] = {}
+        observations_by_tool_call: dict[str, list[ObservationBaseEvent]] = {}
+
+        for event in events:
+            if not isinstance(event, ActionEvent):
+                continue
+            response_id = str(event.llm_response_id)
+            actions_by_response.setdefault(response_id, []).append(event)
+
+        for event in events:
+            if not isinstance(event, ObservationBaseEvent):
+                continue
+            observations_by_tool_call.setdefault(str(event.tool_call_id), []).append(
+                event
+            )
+
+        batches: list[ResponseBatch] = []
+        for actions in actions_by_response.values():
+            if not all(
+                str(action.tool_call_id) in observations_by_tool_call
+                for action in actions
+            ):
+                continue
+
+            # Parallel executors may complete siblings in any order.  Canonicalize
+            # their observations back into model action order before comparing two
+            # response batches.
+            observations = [
+                observation
+                for action in actions
+                for observation in observations_by_tool_call[str(action.tool_call_id)]
+            ]
+            batches.append((actions, observations))
+        return batches
+
     def _is_stuck_repeating_action_observation(
-        self, last_actions: list[Event], last_observations: list[Event]
+        self, response_batches: list[ResponseBatch]
     ) -> bool:
         # scenario 1: same action, same observation
         threshold = self.action_observation_threshold
 
-        # Check for a loop of identical action-observation pairs
-        if len(last_actions) >= threshold and len(last_observations) >= threshold:
+        # Check for a loop of identical response-level action-observation batches.
+        last_batches = response_batches[-threshold:]
+        if len(last_batches) >= threshold:
             logger.debug(
-                f"Found {len(last_actions)} actions and "
-                f"{len(last_observations)} observations, checking for equality"
+                f"Found {len(response_batches)} complete response batches, "
+                "checking for equality"
             )
             actions_equal = all(
-                self._event_eq(last_actions[0], action)
-                for action in last_actions[:threshold]
+                self._event_lists_eq(last_batches[0][0], batch[0])
+                for batch in last_batches[1:]
             )
             observations_equal = all(
-                self._event_eq(last_observations[0], observation)
-                for observation in last_observations[:threshold]
+                self._event_lists_eq(last_batches[0][1], batch[1])
+                for batch in last_batches[1:]
             )
             logger.debug(
                 f"Actions equal: {actions_equal}, "
@@ -167,29 +207,31 @@ class StuckDetector:
                 return True
         else:
             logger.debug(
-                f"Not enough actions/observations: {len(last_actions)} actions,"
-                f" {len(last_observations)} observations"
+                f"Not enough complete response batches: {len(response_batches)} batches"
             )
 
         return False
 
     def _is_stuck_repeating_action_error(
-        self, last_actions: list[Event], last_observations: list[Event]
+        self, response_batches: list[ResponseBatch]
     ) -> bool:
         # scenario 2: same action, errors
         threshold = self.action_error_threshold
-        if len(last_actions) < threshold or len(last_observations) < threshold:
+        if len(response_batches) < threshold:
             return False
 
-        # are the last N actions the "same"?
+        last_batches = response_batches[-threshold:]
+
+        # Are the last N response-level action batches the "same"?
         if all(
-            self._event_eq(last_actions[0], action)
-            for action in last_actions[:threshold]
+            self._event_lists_eq(last_batches[0][0], batch[0])
+            for batch in last_batches[1:]
         ):
-            # and the last N observations are all errors?
+            # And did every action in every response batch produce an error?
             if all(
                 isinstance(obs, AgentErrorEvent)
-                for obs in last_observations[:threshold]
+                for _actions, observations in last_batches
+                for obs in observations
             ):
                 logger.warning("Action, Error loop detected")
                 return True
@@ -224,34 +266,21 @@ class StuckDetector:
 
         return agent_message_count >= threshold
 
-    def _is_stuck_alternating_action_observation(self, events: list[Event]) -> bool:
+    def _is_stuck_alternating_action_observation(
+        self, response_batches: list[ResponseBatch]
+    ) -> bool:
         # scenario 4: alternating action-observation loop
         threshold = self.alternating_pattern_threshold
 
-        last_actions: list[Event] = []
-        last_observations: list[Event] = []
-
-        # collect most recent N actions and N observations
-        for event in reversed(events):
-            if isinstance(event, ActionEvent) and len(last_actions) < threshold:
-                last_actions.append(event)
-            elif (
-                isinstance(event, (ObservationEvent, AgentErrorEvent))
-                and len(last_observations) < threshold
-            ):
-                last_observations.append(event)
-
-            if len(last_actions) == threshold and len(last_observations) == threshold:
-                break
-
-        if len(last_actions) == threshold and len(last_observations) == threshold:
+        last_batches = response_batches[-threshold:]
+        if len(last_batches) == threshold:
             # Check alternating pattern: [A, B, A, B, A, B] where even/odd match
             actions_equal = all(
-                self._event_eq(last_actions[i], last_actions[i + 2])
+                self._event_lists_eq(last_batches[i][0], last_batches[i + 2][0])
                 for i in range(threshold - 2)
             )
             observations_equal = all(
-                self._event_eq(last_observations[i], last_observations[i + 2])
+                self._event_lists_eq(last_batches[i][1], last_batches[i + 2][1])
                 for i in range(threshold - 2)
             )
 
@@ -260,6 +289,12 @@ class StuckDetector:
                 return True
 
         return False
+
+    def _event_lists_eq(self, events1: list[Event], events2: list[Event]) -> bool:
+        return len(events1) == len(events2) and all(
+            self._event_eq(event1, event2)
+            for event1, event2 in zip(events1, events2, strict=True)
+        )
 
     def _is_stuck_context_window_error(self, _events: list[Event]) -> bool:
         """Detects if we are stuck in a loop of context window errors.
@@ -283,13 +318,21 @@ class StuckDetector:
 
         # For ActionEvents, compare the action content, ignoring IDs
         if isinstance(event1, ActionEvent) and isinstance(event2, ActionEvent):
-            return (
+            base_equal = (
                 event1.source == event2.source
                 and event1.thought == event2.thought
                 and event1.action == event2.action
                 and event1.tool_name == event2.tool_name
                 # Ignore tool_call_id, llm_response_id, action_id as they vary
             )
+            if not base_equal:
+                return False
+            # Invalid or unknown tools have ``action=None``.  Their raw tool-call
+            # arguments are still semantically relevant; ignoring them makes
+            # parallel calls to the same tool with different arguments look equal.
+            if event1.action is None and event2.action is None:
+                return event1.tool_call.arguments == event2.tool_call.arguments
+            return True
 
         # For ObservationEvents, compare the observation content, ignoring IDs
         if isinstance(event1, ObservationEvent) and isinstance(
