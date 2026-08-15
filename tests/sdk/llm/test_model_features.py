@@ -371,6 +371,8 @@ def test_prompt_cache_retention_support(model, expected_retention):
 @pytest.mark.parametrize(
     "model,expected_send_reasoning",
     [
+        ("openai/Qwen/Qwen3.8-27B", True),
+        ("QWEN3.8-4B", True),  # Case insensitive
         ("kimi-k2-thinking", True),
         ("kimi-k2-thinking-0905", True),
         ("Kimi-K2-Thinking", True),  # Case insensitive
@@ -388,6 +390,7 @@ def test_prompt_cache_retention_support(model, expected_retention):
         ("litellm_proxy/deepseek/deepseek-v4-flash", True),
         # Models that should NOT match
         ("deepseek/deepseek-chat", False),  # Different DeepSeek model
+        ("openai/Qwen/Qwen3.5-27B", False),  # Different Qwen model
         ("kimi-k2-instruct", False),  # Different variant
         ("gpt-4o", False),
         ("claude-3-5-sonnet", False),

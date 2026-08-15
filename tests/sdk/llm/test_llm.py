@@ -940,6 +940,42 @@ def test_llm_force_string_serializer_auto_detect():
     assert isinstance(formatted_gpt[0]["content"], str)
 
 
+def test_qwen38_replays_assistant_reasoning_content():
+    reasoning_sentinel = "QWEN38_REASONING_REPLAY_SENTINEL"
+    llm = LLM(
+        model="openai/Qwen/Qwen3.8-27B",
+        api_key=SecretStr("test_key"),
+        usage_id="test-qwen38-reasoning-replay",
+    )
+    messages = [
+        Message(role="user", content=[TextContent(text="First turn")]),
+        Message(
+            role="assistant",
+            content=[TextContent(text="I will call a tool.")],
+            reasoning_content=reasoning_sentinel,
+            tool_calls=[
+                MessageToolCall(
+                    id="call_1",
+                    name="finish",
+                    arguments='{"message":"done"}',
+                    origin="completion",
+                )
+            ],
+        ),
+        Message(
+            role="tool",
+            content=[TextContent(text="Tool completed")],
+            tool_call_id="call_1",
+            name="finish",
+        ),
+        Message(role="user", content=[TextContent(text="Second turn")]),
+    ]
+
+    formatted = llm.format_messages_for_llm(messages)
+
+    assert formatted[1]["reasoning_content"] == reasoning_sentinel
+
+
 def test_llm_force_string_serializer_override():
     """Test force_string_serializer can be explicitly set to override auto-detect."""
     # Set force_string_serializer=True for a model that normally doesn't need it
